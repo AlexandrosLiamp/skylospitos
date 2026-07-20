@@ -1,0 +1,63 @@
+/* Spitogatos "Μόνο Ιδιώτες" — on-page toggle button styles.
+   Defensive resets: the site's global CSS could otherwise inherit into us
+   (font-size, box-sizing, borders on <div>). We reset only what matters. */
+
+.sg-filter-toggle {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 2147483000;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 999px;
+  box-sizing: border-box;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  user-select: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.08);
+  transition: background-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sg-filter-toggle:hover {
+  filter: brightness(0.95);
+}
+
+.sg-filter-toggle:active {
+  transform: translateY(1px);
+}
+
+.sg-filter-toggle:focus-visible {
+  outline: 2px solid #0E8C8C;
+  outline-offset: 2px;
+}
+
+.sg-filter-toggle[data-on="true"] {
+  background-color: #0E8C8C;
+  color: #ffffff;
+}
+
+.sg-filter-toggle[data-on="false"] {
+  background-color: #e5e5e5;
+  color: #555555;
+}
+
+.sg-filter-toggle__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: currentColor;
+  opacity: 0.95;
+}
+
+.sg-filter-toggle[data-on="false"] .sg-filter-toggle__dot {
+  opacity: 0.4;
+}

@@ -1,34 +1,34 @@
 /* Spitogatos "Μόνο Ιδιώτες" — on-page toggle button styles.
-   Defensive resets: the site's global CSS could otherwise inherit into us
-   (font-size, box-sizing, borders on <div>). We reset only what matters. */
+   The button sits inline in the site's filter toolbar, right after
+   "Αποθήκευση". Dimensions mirror the site's other filter buttons
+   (40px height, 5px radius, Manrope). White when off, orange when on
+   — matching the site's save-search button in its active state. */
 
 .sg-filter-toggle {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  z-index: 2147483000;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  margin: 0;
-  padding: 10px 16px;
-  border: none;
-  border-radius: 999px;
+  margin: 0 0 0 8px;
+  padding: 0 15px;
+  height: 40px;
+  border: 1px solid rgba(185, 189, 209, 0.5);
+  border-radius: 5px;
   box-sizing: border-box;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 13px;
-  font-weight: 600;
+  font-family: Manrope, Arial, sans-serif;
+  font-size: 14px;
+  font-weight: 700;
   line-height: 1;
-  letter-spacing: 0.01em;
   cursor: pointer;
   user-select: none;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.08);
-  transition: background-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
+  background-color: #ffffff;
+  color: #333333;
+  transition: background-color 0.15s ease, color 0.15s ease,
+              border-color 0.15s ease, transform 0.05s ease;
   -webkit-font-smoothing: antialiased;
 }
 
 .sg-filter-toggle:hover {
-  filter: brightness(0.95);
+  filter: brightness(0.97);
 }
 
 .sg-filter-toggle:active {
@@ -36,18 +36,14 @@
 }
 
 .sg-filter-toggle:focus-visible {
-  outline: 2px solid #0E8C8C;
+  outline: 2px solid #FE900A;
   outline-offset: 2px;
 }
 
 .sg-filter-toggle[data-on="true"] {
-  background-color: #0E8C8C;
+  background-color: #FE900A;
   color: #ffffff;
-}
-
-.sg-filter-toggle[data-on="false"] {
-  background-color: #e5e5e5;
-  color: #555555;
+  border-color: #FE900A;
 }
 
 .sg-filter-toggle__dot {
@@ -59,5 +55,16 @@
 }
 
 .sg-filter-toggle[data-on="false"] .sg-filter-toggle__dot {
-  opacity: 0.4;
+  opacity: 0.5;
+}
+
+/* Fallback pill for pages that don't render the filter toolbar. */
+.sg-filter-toggle--floating {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 2147483000;
+  margin: 0;
+  border-radius: 999px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.08);
 }

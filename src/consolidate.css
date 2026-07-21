@@ -157,3 +157,34 @@
   font-size: 12px;
   color: #888;
 }
+
+/* Error state: same shell, red accent on the header dot, retry button
+   right below the note. */
+
+.sg-v02-consolidated--error .sg-v02-consolidated__header::before {
+  background: #d33;
+}
+
+.sg-v02-consolidated__retry {
+  display: inline-flex;
+  align-items: center;
+  margin: 4px 8px 0;
+  padding: 8px 14px;
+  border: 1px solid rgba(185, 189, 209, 0.7);
+  border-radius: 5px;
+  background: #ffffff;
+  font-family: Manrope, Arial, sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  color: #333;
+  cursor: pointer;
+}
+
+.sg-v02-consolidated__retry:hover {
+  background: #f5f5f5;
+}
+
+.sg-v02-consolidated__retry:focus-visible {
+  outline: 2px solid #FE900A;
+  outline-offset: 2px;
+}

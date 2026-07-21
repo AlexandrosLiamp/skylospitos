@@ -37,6 +37,40 @@ reload the document). It also hides the "Χρειάζεσαι τη βοήθει�
 ειδικού;" expert-banner card that agencies pay to place inside the results
 grid.
 
+## Consolidated view (v0.2)
+
+Big searches spread the few private listings across many pages, and paging
+through them one at a time is the whole tedium the extension is trying to
+solve. As of v0.2 there's a second button, **"Δείξε όλες"**, that appears
+next to "Μόνο Ιδιώτες" once the filter is on. Click it and the extension
+fetches the remaining pages of the current search directly from the site's
+own JSON API (`/n_api/v1/properties/search-results`) and appends every
+private listing from every page in a single section below the results grid.
+No pagination clicking, no reload.
+
+Practical details worth knowing before you turn it on:
+
+- It's opt-in and off by default. The v1 hide-agency-cards filter is
+  unchanged.
+- Each search triggers up to N extra API calls, one per page of results,
+  spaced 200 ms apart. On a 3-page rentals search that's 3 calls; on a
+  20-page sales search in a big city that's 20. This is the same endpoint
+  the site's own Vue app already calls unauthenticated.
+- Hard cap: 20 pages / 600 listings. Anything past that is silently
+  truncated with a note. The cap exists so an ambitious search
+  ("Πάτρα ενοικίαση") doesn't spawn 50 requests in a row; if the cap
+  hits you a lot, `MAX_PAGES` in `src/consolidate.js` is one line to
+  change.
+- Cache is per search URL and per sort — changing area, category or sort
+  drops the cache and re-fetches; clicking a plain paginator number
+  (/selida_2, /selida_3) reuses it.
+- If a fetch fails, you get a "Δοκιμάστε ξανά" retry button in the
+  section header. The extension does not auto-retry — a rate-limited
+  loop is how you get your IP blocked.
+- Cards in the consolidated section have a softer border than the site's
+  own so you can tell it's extension-added content, not part of
+  spitogatos.gr's own grid.
+
 ## Install
 
 There's no Chrome Web Store listing. To install from source:
@@ -58,13 +92,11 @@ background worker.
   The map on the right still drops a pin for every listing regardless of
   poster type. If you rely on the map to find neighborhoods, you'll still
   see agency locations there.
-- **Consolidate results across pages.** If a search returns 5 private
-  listings scattered across 8 pages, you still page through 8 pages. This is
-  a candidate for a future version (see `PLAN.md`, "Optional: the data-layer
-  approach").
-- **Anything server-side.** This is 100% a DOM filter running in your
-  browser. Nothing about your search is sent anywhere; if the site changes
-  its markup, the filter can break until the selectors are updated.
+- **Anything server-side of its own.** Filtering is a pure DOM operation
+  in your browser. The v0.2 consolidated view calls spitogatos.gr's own
+  public search-results API (the same one the site's Vue app uses), but
+  nothing about your search is sent anywhere else and there's no
+  telemetry.
 
 ## Expected results by region
 
@@ -84,16 +116,22 @@ that the filter itself is running (the console will log
 ## Repo layout
 
 ```
-manifest.json     MV3 manifest
-src/content.js    Everything: detection, hiding, observer, toggle button
-src/styles.css    Toggle button styling
-icons/            16 / 48 / 128 px placeholder icons
-PLAN.md           Full build plan and site research notes
+manifest.json         MV3 manifest
+src/content.js        v1: detection, hiding, observer, "Μόνο Ιδιώτες" toggle
+src/styles.css        v1: toggle button styling
+src/consolidate.js    v0.2: API fetch, consolidated section, "Δείξε όλες" toggle
+src/consolidate.css   v0.2: secondary toggle + consolidated section + card grid
+icons/                16 / 48 / 128 px placeholder icons
+PLAN.md               v1 build plan and site research notes
+PLAN_V02.md           v0.2 milestones, API research, non-goals
 ```
 
-`PLAN.md` is worth reading if you want to modify the extension. It documents
-which selectors were validated against how many real listings, and why the
-DOM icon approach was chosen over reading Nuxt's internal store.
+`PLAN.md` and `PLAN_V02.md` are worth reading if you want to modify the
+extension. `PLAN.md` documents which selectors were validated against how
+many real listings and why the DOM icon approach was chosen; `PLAN_V02.md`
+carries the API response shape, the private-listing signal (`enquirerId`),
+and the rate-limit observations under which the 200 ms per-request delay
+was picked.
 
 ## Development
 
@@ -101,8 +139,9 @@ Edit the source files, then click the reload arrow on the extension's card
 in `chrome://extensions/`. A page refresh alone doesn't pick up code
 changes — Chrome caches the loaded extension until you tell it to reload.
 
-There are no build steps, no dependencies, no bundler. The whole thing is
-about 100 lines of vanilla JS and 50 lines of CSS.
+There are no build steps, no dependencies, no bundler. v1 is about 130
+lines of JS + 50 lines of CSS; v0.2 adds another ~450 lines of JS + ~160
+lines of CSS on top.
 
 ## Contributing
 

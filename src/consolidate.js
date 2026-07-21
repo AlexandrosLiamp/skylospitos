@@ -37,8 +37,17 @@ const MAX_PAGES = 20;
 const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, lastPage }
 
 function canonicalizeUrl(href) {
-  // Group all /selida_N variants of the same search under one cache key.
-  return href.replace(/\/selida_\d+(?=\/|$|\?)/, '').replace(/[?#].*$/, '');
+  // Group all /selida_N variants of the same search under one cache key,
+  // but keep the query string — sort/price/filter params live there and
+  // a different sort is a different result set.
+  try {
+    const u = new URL(href);
+    u.pathname = u.pathname.replace(/\/selida_\d+(?=\/|$)/, '');
+    u.hash = '';
+    return u.toString();
+  } catch {
+    return href.replace(/\/selida_\d+(?=\/|$|\?)/, '').replace(/#.*$/, '');
+  }
 }
 
 function findApiCallUrl() {
@@ -69,9 +78,10 @@ function findApiCallUrl() {
   return null;
 }
 
-async function waitForApiCall(timeoutMs = 5000, pollMs = 150) {
+async function waitForApiCall(timeoutMs = 5000, pollMs = 150, signal) {
   const start = performance.now();
   while (performance.now() - start < timeoutMs) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const url = findApiCallUrl();
     if (url) return url;
     await new Promise((r) => setTimeout(r, pollMs));
@@ -100,32 +110,59 @@ function derivePrefix(knownIds) {
   return null;
 }
 
-async function fetchPageByOffset(baseUrl, offset) {
+async function fetchPageByOffset(baseUrl, offset, signal) {
   const url = new URL(baseUrl);
   url.searchParams.set('offset', String(offset));
-  const res = await fetch(url.toString(), { credentials: 'include' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} at offset ${offset}`);
+  const res = await fetch(url.toString(), { credentials: 'include', signal });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status} at offset ${offset}`);
+    err.status = res.status;
+    err.offset = offset;
+    throw err;
+  }
   return res.json();
 }
 
-async function fetchAllPagesForCurrentSearch() {
+async function fetchWithBackoff(apiUrl, offset, signal, backoffState) {
+  // One retry on 429 per session, with a growing delay. Anything else
+  // bubbles up to renderConsolidationError so the user can decide.
+  try {
+    return await fetchPageByOffset(apiUrl, offset, signal);
+  } catch (err) {
+    if (err.status === 429 && backoffState.tries < 1) {
+      backoffState.tries++;
+      backoffState.delayMs = Math.min(backoffState.delayMs * 4, 2000);
+      console.warn(
+        `[SG-V02] 429 at offset ${offset} — backing off to ${backoffState.delayMs}ms`
+      );
+      await new Promise((r) => setTimeout(r, backoffState.delayMs));
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      return await fetchPageByOffset(apiUrl, offset, signal);
+    }
+    throw err;
+  }
+}
+
+async function fetchAllPagesForCurrentSearch(signal) {
   const canonical = canonicalizeUrl(location.href);
   if (cache.has(canonical)) {
     console.log('[SG-V02] cache hit for', canonical);
     return cache.get(canonical);
   }
 
-  const apiUrl = await waitForApiCall();
+  const apiUrl = await waitForApiCall(5000, 150, signal);
   if (!apiUrl) {
     console.warn(
       '[SG-V02] never observed a /n_api/v1/properties/search-results call in 5s — page may not be a search results page'
     );
     return null;
   }
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
   console.log('[SG-V02] fetching all pages for', canonical);
 
-  const page1 = await fetchPageByOffset(apiUrl, 0);
+  const backoffState = { tries: 0, delayMs: PAGE_DELAY_MS };
+  const page1 = await fetchWithBackoff(apiUrl, 0, signal, backoffState);
   const perPage = page1.pagination?.perPage ?? 30;
   const declaredLastPage = page1.pagination?.lastPage ?? 1;
   const lastPage = Math.min(declaredLastPage, MAX_PAGES);
@@ -133,8 +170,9 @@ async function fetchAllPagesForCurrentSearch() {
 
   const allListings = [...page1.data];
   for (let p = 2; p <= lastPage; p++) {
-    await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
-    const pageData = await fetchPageByOffset(apiUrl, (p - 1) * perPage);
+    await new Promise((r) => setTimeout(r, backoffState.delayMs));
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const pageData = await fetchWithBackoff(apiUrl, (p - 1) * perPage, signal, backoffState);
     allListings.push(...pageData.data);
   }
 
@@ -285,6 +323,8 @@ const V1_TOGGLE_ID = 'sg-filter-toggle';
 
 let consolidateEnabled = false;
 let v02Loading = false;
+let lastFullHref = location.href;
+let activeController = null;
 
 function ensureV02Toggle() {
   // v0.2 button lives immediately after the v1 "Μόνο Ιδιώτες" button so
@@ -343,13 +383,17 @@ function updateV02ToggleUI(btn) {
 }
 
 async function onV02Click() {
-  if (v02Loading) return;
+  // If loading and the click is turning consolidation ON again, ignore.
+  // Turning OFF mid-load is allowed and aborts the in-flight fetch.
+  if (v02Loading && !consolidateEnabled) return;
   consolidateEnabled = !consolidateEnabled;
   chrome.storage.sync.set({ [V02_STORAGE_KEY]: consolidateEnabled });
   if (consolidateEnabled) {
     await runConsolidation();
   } else {
+    if (activeController) activeController.abort();
     removeConsolidatedSection();
+    v02Loading = false;
     updateV02ToggleUI();
   }
 }
@@ -359,36 +403,111 @@ function removeConsolidatedSection() {
   if (existing) existing.remove();
 }
 
+function renderConsolidationError(pageNumber, message, canonical) {
+  const existing = document.getElementById(SECTION_ID);
+  if (existing) existing.remove();
+
+  const section = document.createElement('section');
+  section.id = SECTION_ID;
+  section.className = 'sg-v02-consolidated sg-v02-consolidated--error';
+
+  const header = document.createElement('div');
+  header.className = 'sg-v02-consolidated__header';
+  header.textContent = 'Απέτυχε η συγκεντρωτική προβολή';
+  section.appendChild(header);
+
+  const note = document.createElement('div');
+  note.className = 'sg-v02-consolidated__note';
+  note.textContent =
+    pageNumber != null
+      ? `Σφάλμα στη σελίδα ${pageNumber}: ${message}`
+      : `Σφάλμα: ${message}`;
+  section.appendChild(note);
+
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'sg-v02-consolidated__retry';
+  retry.textContent = 'Δοκιμάστε ξανά';
+  retry.addEventListener('click', () => {
+    cache.delete(canonical);
+    runConsolidation();
+  });
+  section.appendChild(retry);
+
+  const resultsSection = document.querySelector('section.search-results__results');
+  if (resultsSection) resultsSection.after(section);
+  else document.body.appendChild(section);
+}
+
 async function runConsolidation() {
+  if (activeController) activeController.abort();
+  activeController = new AbortController();
+  const controller = activeController;
+
   v02Loading = true;
   updateV02ToggleUI();
   try {
-    const result = await fetchAllPagesForCurrentSearch();
+    const result = await fetchAllPagesForCurrentSearch(controller.signal);
+    if (controller.signal.aborted) return;
     renderConsolidatedSection(result);
   } catch (err) {
+    if (err?.name === 'AbortError') return;
     console.error('[SG-V02] fetch pipeline failed:', err);
+    const pageNumber = err?.offset != null ? Math.floor(err.offset / 30) + 1 : null;
+    renderConsolidationError(pageNumber, err?.message || String(err), canonicalizeUrl(location.href));
   } finally {
-    v02Loading = false;
-    updateV02ToggleUI();
+    if (controller === activeController) {
+      v02Loading = false;
+      updateV02ToggleUI();
+    }
   }
 }
 
 console.log('[SG-V02] consolidate.js loaded');
 
 // Watch the DOM so we can (a) attach the v0.2 toggle once the v1 button
-// appears in the site's toolbar, and (b) re-render if the v1 button state
+// appears in the site's toolbar, (b) re-render if the v1 button state
 // flips (its button lives outside the search-results section but its
 // data-on attribute changes via v1's click handler — we listen to storage
-// events for that separately). A 250ms debounce is enough here; this
-// isn't on any hot path.
+// events for that separately), and (c) detect Vue-driven navigation so
+// we invalidate the cache on a real search change or re-dedupe against
+// the newly visible page on a plain paginator click. Debounced at 250ms
+// so we run once after Vue's re-render settles, not on every mutation.
 let v02DomTimer = null;
 new MutationObserver(() => {
   if (v02DomTimer) clearTimeout(v02DomTimer);
   v02DomTimer = setTimeout(() => {
     v02DomTimer = null;
     ensureV02Toggle();
+    handlePossibleNav();
   }, 250);
 }).observe(document.body, { childList: true, subtree: true });
+
+function handlePossibleNav() {
+  const currentHref = location.href;
+  if (currentHref === lastFullHref) return;
+  const prevCanonical = canonicalizeUrl(lastFullHref);
+  const nowCanonical = canonicalizeUrl(currentHref);
+  lastFullHref = currentHref;
+
+  if (!consolidateEnabled) return;
+
+  if (nowCanonical !== prevCanonical) {
+    // Different search (base path or sort/filter param): drop the stale
+    // section, invalidate the previous canonical's cache entry so retrying
+    // that URL later re-fetches fresh data, cancel any in-flight fetch
+    // that was still targeting the old search, and re-run for the new URL.
+    cache.delete(prevCanonical);
+    if (activeController) activeController.abort();
+    removeConsolidatedSection();
+    runConsolidation();
+  } else {
+    // Same search, different /selida_N — the site re-rendered the grid,
+    // so re-run render for a fresh dedupe against the newly visible ids.
+    const cached = cache.get(nowCanonical);
+    if (cached) renderConsolidatedSection(cached);
+  }
+}
 
 // Also listen for v1's toggle flipping via storage changes.
 chrome.storage.onChanged.addListener((changes, area) => {

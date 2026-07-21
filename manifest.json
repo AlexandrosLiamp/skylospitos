@@ -13,8 +13,8 @@
   "content_scripts": [
     {
       "matches": ["https://www.spitogatos.gr/*"],
-      "js": ["src/content.js"],
-      "css": ["src/styles.css"],
+      "js": ["src/content.js", "src/consolidate.js"],
+      "css": ["src/styles.css", "src/consolidate.css"],
       "run_at": "document_idle"
     }
   ]

@@ -1,5 +1,19 @@
 # Spitogatos v0.2 — "Show All Private Listings" (consolidated view)
 
+> **Superseded in part by v0.3.** The research, endpoint facts and fetch
+> strategy below still hold and are still what the code does. The *rendering*
+> decision does not: this plan called for a separate labelled section appended
+> below the site's grid, with deliberately distinct styling. v0.3 replaced that
+> with an in-place takeover — the site's cards and paginator are hidden and the
+> private listings are rendered in their place, in the site's own markup,
+> re-paginated at 30 per page. Milestone 2's "do NOT clone the site's card
+> component" still stands, and v0.3 keeps it: nothing is cloned. What changed is
+> that the built cards now carry the site's class names and its Vue scoped-CSS
+> attributes, both read off a live card at runtime, so the site's own stylesheet
+> draws them. See the header comment in `src/consolidate.js` and the README's
+> "Consolidated view" section for how that works. The 20-page cap in Milestone 5
+> is also gone — the endpoint choice in `planFetch` is what bounds the traffic now.
+
 ## What this adds
 
 With v1 the filter hides agency cards but leaves the site's pagination in

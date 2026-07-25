@@ -1,23 +1,38 @@
-// Spitogatos v0.2 — consolidated view.
+// Spitogatos v0.3 — consolidated view.
 //
 // Runs alongside src/content.js in the same content-script isolated world.
-// See PLAN_V02.md at the repo root for the full feature plan and rationale.
+// See PLAN_V02.md at the repo root for the original feature plan.
+//
+// What this does: fetches every page of the current search, keeps only the
+// private-seller listings, and takes over the site's own results column with
+// them — the site's cards and paginator are hidden, ours stand in their place
+// re-paginated at the site's own 30-per-page. A search with 960 listings of
+// which 58 are private stops being 32 mostly-empty pages and becomes 2 full ones.
 //
 // M0 research findings (2026-07-20), used by everything below:
 //
-//   Endpoint: /n_api/v1/properties/search-results-map?…&offset={0,300,600,…}
-//     - 300 listings per request, JSON, no auth required. Same query string as
-//       the card endpoint, same property objects, 10x the page size.
-//     - Response: { data: { "<geohash>_exact": { properties: [...] }, … },
-//                   count, total }
-//     - The obvious-looking /search-results endpoint returns the same listings
-//       30 at a time and is what the card grid uses; we deliberately do not.
-//       On Πάτρα rentals that's 347 requests vs 34 for identical output
-//       (589 private listings either way, verified 2026-07-25). Sustained
-//       concurrency against the 347-request version drew HTTP 405 soft
-//       throttling from the server; the 34-request version does not.
-//     - offset paging is disjoint and stable (0 overlap across offsets
-//       0/300/600), and limit/perPage are ignored — 300 is a hard cap.
+//   Endpoints — same query string (the search itself), only the pathname differs:
+//     /n_api/v1/properties/search-results      → 30/request, { data: [...],
+//         pagination: { totalResults, perPage, lastPage }, meta }. What the
+//         card grid itself uses. Includes each listing's description text.
+//     /n_api/v1/properties/search-results-map  → 300/request, { data: {
+//         "<geohash>_exact": { properties: [...] }, … }, count, total }. The
+//         map's pin data: same property objects, 10x the page size, but the
+//         description field comes back empty.
+//     Both are JSON and need no auth. offset paging is disjoint and stable,
+//     and limit/perPage are ignored — the page sizes above are hard caps.
+//
+//   Which one we use is chosen per search (see planFetch): the card endpoint
+//   while its request count stays inside LIST_REQUEST_BUDGET, because its
+//   descriptions are what make our cards look like the site's; the map
+//   endpoint beyond that, because a wide search is otherwise hundreds of
+//   requests. Πάτρα rentals unfiltered is 347 card requests vs 34 map ones,
+//   and sustained concurrency at 347 drew HTTP 405 soft throttling from the
+//   server (2026-07-25); the map version does not.
+//
+//   Response locale is set by the Accept-Language header, not a query param.
+//     Without it the API answers in English ("Skagiopouleio (Patra)") even on
+//     the Greek site, so we send one derived from <html lang>.
 //
 //   Per-item private flag: !!item.enquirerId
 //     - Matches DOM detection exactly: 17/30 on Arta rentals page 1 (matches
@@ -28,22 +43,50 @@
 //     - The site's Vue app calls the endpoint for the current search before
 //       we run. Its entry lives in performance.getEntriesByType('resource')
 //       (Performance API is shared between MAIN and isolated worlds).
-//     - We grab that URL, keep the query string, and only swap `offset`.
+//     - We grab that URL, keep the query string, and swap the pathname/offset.
 //
 //   Deriving the /aggelia/... link for a card:
 //     - DOM aggelia URLs have a 2-char category prefix + the numeric item id
 //       (e.g. /aggelia/2120192368 for item id 20192368 on rentals+residential).
 //     - Prefix varies by listing type / category, so we derive it at runtime
 //       from a DOM card that's already on the page.
+//
+// v0.3 research findings (2026-07-25), which the takeover rendering rests on:
+//
+//   The site's card styles are Vue scoped CSS — every rule is qualified by a
+//   build-specific attribute (`.tile__img .img__wrap[data-v-e2848626]`). Class
+//   names alone inherit nothing. So we harvest the attribute names off a live
+//   DOM card and stamp them onto ours; the site's own stylesheet then does all
+//   the visual work and our cards track its redesigns for free. The attribute
+//   values change every deploy, which is exactly why nothing here is hardcoded.
+//
+//   Same reasoning for the label text the API doesn't carry: `subtype` is a
+//   numeric code, `floorNumber` is an enum (3 → "ΙΣ", 4 → "ΗΜ", 6 → "1ος"),
+//   and the units next to the room counts are localised strings. Rather than
+//   hardcode a table that would be wrong in English and stale after a site
+//   change, we pair the ~30 DOM cards against their API records on every run
+//   and read the mapping straight off the page (learnFromDom), persisting what
+//   we learn so a rarely-seen subtype stays known.
+//
+//   Our cards go in a `display: contents` wrapper: one foreign node for Vue to
+//   patch around, but the cards themselves participate in the results column's
+//   own layout, so list view and gallery view both lay out natively.
 
 const API_LIST_PATH = '/n_api/v1/properties/search-results';
 const API_MAP_PATH = '/n_api/v1/properties/search-results-map';
-const MAP_PAGE_SIZE = 300; // the -map endpoint's own cap; limit/perPage are ignored, same as the card endpoint's 30
+const LIST_PAGE_SIZE = 30; // the card endpoint's own cap; limit/perPage are ignored
+const MAP_PAGE_SIZE = 300; // the map endpoint's own cap, same story
+// Past this many card-endpoint requests a search is wide enough that the
+// descriptions aren't worth the traffic, and we switch to the map endpoint.
+// 40 covers ~1200 listings, which is any search a person has actually narrowed.
+const LIST_REQUEST_BUDGET = 40;
 const CHUNK_SIZE = 6;
 const CHUNK_DELAY_MS = 200;
 const BACKOFF_BASE_DELAY_MS = 200; // starting delay for the one-shot 429/405 backoff, not inter-request pacing
 
-const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, requests, prefix }
+const RESULTS_PER_PAGE = 30; // matches the site's own pagination.perPage
+
+const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, requests }
 
 function canonicalizeUrl(href) {
   // Group all /selida_N variants of the same search under one cache key,
@@ -59,21 +102,18 @@ function canonicalizeUrl(href) {
   }
 }
 
-function findApiCallUrl() {
-  // Two related endpoints exist, both driven by the identical query string
-  // (the search itself); only the pathname differs:
-  //   /search-results       — paginated card data, { data: [...], pagination, meta }
-  //   /search-results-map   — the map's pin data, { data: {bucket:...}, count, total }
-  //
-  // We want the -map one. It returns the same property objects as the card
-  // endpoint (same fields, including the enquirerId private flag) but 300 at
-  // a time instead of 30, which is the difference between 34 requests and 347
-  // on a city-sized search. Verified equivalent, not assumed: on Ν. Άρτας
-  // rentals both endpoints yield the same 60 listings and the exact same 45
-  // private ids; on Πάτρα rentals both yield the same 589 private listings.
-  //
-  // So whichever of the two the site happened to fire, take its params and
-  // force the pathname to -map.
+function apiHeaders() {
+  // The API answers in English unless asked otherwise, regardless of which
+  // locale of the site the user is on, so mirror <html lang> explicitly.
+  const lang = document.documentElement.lang || 'el';
+  const base = lang.split('-')[0];
+  return { 'Accept-Language': base === lang ? lang : `${lang},${base};q=0.9` };
+}
+
+function findApiCallUrl(pathname) {
+  // Both endpoints are driven by the identical query string, so whichever of
+  // the two the site happened to fire, take its params and force the pathname
+  // we want.
   const entries = performance.getEntriesByType('resource');
   const byPath = (path) =>
     entries.filter((e) => {
@@ -84,10 +124,10 @@ function findApiCallUrl() {
       }
     });
 
-  const hit = byPath(API_MAP_PATH).pop() || byPath(API_LIST_PATH).pop();
+  const hit = byPath(API_LIST_PATH).pop() || byPath(API_MAP_PATH).pop();
   if (!hit) return null;
   const u = new URL(hit.name);
-  u.pathname = API_MAP_PATH;
+  u.pathname = pathname;
   return u.toString();
 }
 
@@ -95,55 +135,52 @@ async function waitForApiCall(timeoutMs = 5000, pollMs = 150, signal) {
   const start = performance.now();
   while (performance.now() - start < timeoutMs) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const url = findApiCallUrl();
+    const url = findApiCallUrl(API_LIST_PATH);
     if (url) return url;
     await new Promise((r) => setTimeout(r, pollMs));
   }
   return null;
 }
 
-function derivePrefix(knownIds) {
-  // Match a DOM aggelia link's numeric suffix against any known API item id
-  // and return the leading chars — the category prefix (e.g. "21" for rent+home).
-  const links = document.querySelectorAll(
-    'article.ordered-element a[href*="/aggelia/"]'
-  );
-  for (const link of links) {
-    const href = link.getAttribute('href') || '';
-    const match = href.match(/\/aggelia\/(\d+)/);
-    if (!match) continue;
-    const fullId = match[1];
-    for (const knownId of knownIds) {
-      const s = String(knownId);
-      if (fullId.length > s.length && fullId.endsWith(s)) {
-        return fullId.slice(0, fullId.length - s.length);
-      }
-    }
+function withPath(url, pathname) {
+  const u = new URL(url);
+  u.pathname = pathname;
+  return u.toString();
+}
+
+function parseSearchResponse(json) {
+  // Card endpoint: a plain array plus a pagination block.
+  if (Array.isArray(json?.data)) {
+    return {
+      items: json.data,
+      total: json.pagination?.totalResults ?? json.data.length,
+    };
   }
-  return null;
+  // Map endpoint: listings grouped into geohash buckets keyed by location.
+  // Bucket identity only says where to drop a pin, which we never render, so
+  // flatten straight back to a plain listing array.
+  const items = [];
+  for (const bucket of Object.values(json?.data || {})) {
+    if (Array.isArray(bucket?.properties)) items.push(...bucket.properties);
+  }
+  return { items, total: json?.total ?? items.length };
 }
 
 async function fetchPageByOffset(baseUrl, offset, signal) {
   const url = new URL(baseUrl);
   url.searchParams.set('offset', String(offset));
-  const res = await fetch(url.toString(), { credentials: 'include', signal });
+  const res = await fetch(url.toString(), {
+    credentials: 'include',
+    headers: apiHeaders(),
+    signal,
+  });
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status} at offset ${offset}`);
     err.status = res.status;
     err.offset = offset;
     throw err;
   }
-  const json = await res.json();
-
-  // The map endpoint groups listings into geohash buckets keyed by location
-  // ({ data: { "sqz3wd1p_exact": { properties: [...] }, … }, count, total }).
-  // Bucket identity only says where to drop a pin, which we never render, so
-  // flatten straight back to a plain listing array.
-  const items = [];
-  for (const bucket of Object.values(json.data || {})) {
-    if (Array.isArray(bucket?.properties)) items.push(...bucket.properties);
-  }
-  return { items, total: json.total ?? items.length };
+  return parseSearchResponse(await res.json());
 }
 
 async function fetchWithBackoff(apiUrl, offset, signal, backoffState) {
@@ -191,8 +228,6 @@ async function fetchChunkWithBackoff(apiUrl, offsets, signal, backoffState) {
   // 405 shows up alongside 429 when the live site throttles (confirmed
   // empirically — a lone retry of a 405'd offset succeeds instantly, so it's a
   // soft burst-throttle, not a real client error). Treat it the same as 429.
-  // This mattered a lot back when a city search meant 347 requests; at 34 it
-  // has not fired once, but it stays as cheap insurance.
   const isThrottle = (status) => status === 429 || status === 405;
   const realErrors = failures.filter((f) => !isThrottle(f.err?.status));
   if (realErrors.length > 0) throw lowest(realErrors).err;
@@ -226,6 +261,31 @@ async function fetchChunkWithBackoff(apiUrl, offsets, signal, backoffState) {
   );
 }
 
+async function planFetch(signal, backoffState) {
+  // Decide which endpoint this particular search gets, and hand back its first
+  // page so the decision costs nothing extra on the common path.
+  const observed = await waitForApiCall(5000, 150, signal);
+  if (!observed) return null;
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  const listUrl = withPath(observed, API_LIST_PATH);
+  const first = await fetchWithBackoff(listUrl, 0, signal, backoffState);
+  const listRequests = Math.max(1, Math.ceil(first.total / LIST_PAGE_SIZE));
+  if (listRequests <= LIST_REQUEST_BUDGET) {
+    return { apiUrl: listUrl, pageSize: LIST_PAGE_SIZE, first, requests: listRequests };
+  }
+
+  // Too wide for the card endpoint. The one request we just spent is the price
+  // of finding that out; from here the map endpoint does it in a tenth of the calls.
+  const mapUrl = withPath(observed, API_MAP_PATH);
+  const mapFirst = await fetchWithBackoff(mapUrl, 0, signal, backoffState);
+  const mapRequests = Math.max(1, Math.ceil(mapFirst.total / MAP_PAGE_SIZE));
+  console.log(
+    `[SG-V02] ${first.total} listings — too wide for the card endpoint (${listRequests} requests), using the map endpoint (${mapRequests})`
+  );
+  return { apiUrl: mapUrl, pageSize: MAP_PAGE_SIZE, first: mapFirst, requests: mapRequests };
+}
+
 async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
   const canonical = canonicalizeUrl(location.href);
   if (cache.has(canonical)) {
@@ -233,21 +293,18 @@ async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
     return cache.get(canonical);
   }
 
-  const apiUrl = await waitForApiCall(5000, 150, signal);
-  if (!apiUrl) {
+  const backoffState = { tries: 0, delayMs: BACKOFF_BASE_DELAY_MS };
+  const plan = await planFetch(signal, backoffState);
+  if (!plan) {
     console.warn(
       '[SG-V02] never observed a /n_api/v1/properties/search-results[-map] call in 5s — page may not be a search results page'
     );
     return null;
   }
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
   console.log('[SG-V02] fetching all pages for', canonical);
-
-  const backoffState = { tries: 0, delayMs: BACKOFF_BASE_DELAY_MS };
-  const first = await fetchWithBackoff(apiUrl, 0, signal, backoffState);
+  const { apiUrl, pageSize, first, requests } = plan;
   const total = first.total;
-  const requests = Math.max(1, Math.ceil(total / MAP_PAGE_SIZE));
 
   // Dedupe by id while collecting. Offset paging is a snapshot of a live list:
   // if a listing is inserted between two requests every later offset shifts by
@@ -266,7 +323,7 @@ async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
   onProgress(1, requests);
 
   const remainingOffsets = [];
-  for (let o = MAP_PAGE_SIZE; o < total; o += MAP_PAGE_SIZE) remainingOffsets.push(o);
+  for (let o = pageSize; o < total; o += pageSize) remainingOffsets.push(o);
 
   for (let i = 0; i < remainingOffsets.length; i += CHUNK_SIZE) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -281,7 +338,7 @@ async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
   }
 
   const privateOnly = allListings.filter((i) => !!i.enquirerId);
-  const prefix = derivePrefix(allListings.map((i) => i.id));
+  learnFromDom(allListings);
 
   const result = {
     fetchedAt: Date.now(),
@@ -290,126 +347,547 @@ async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
     privateCount: privateOnly.length,
     listings: privateOnly,
     requests,
-    prefix,
   };
   cache.set(canonical, result);
 
   console.log(
-    `[SG-V02] fetched ${requests} request${requests !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private (prefix="${prefix ?? '?'}")`
+    `[SG-V02] fetched ${requests} request${requests !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private`
   );
   return result;
 }
 
-// ---- M2: rendering ----
+// ---- learning the site's presentation from the page itself ----
 
-const SECTION_ID = 'sg-v02-consolidated';
+// Everything the API leaves as a code or omits entirely, read off the DOM by
+// pairing the cards the site rendered against their own API records. Persisted
+// per locale so a subtype seen once stays known on later searches.
+const labels = {
+  subs: {}, // "house|1"        -> "Διαμέρισμα"
+  floors: {}, // floorNumber 6    -> { lead: "1", tail: "ος" }, 3 -> { lead: "ΙΣ", tail: "" }
+  units: {}, // "i-icon-bedroom" -> "υ/δ"
+  prefixes: {}, // "house|1"     -> "21"  (the /aggelia/ id prefix)
+  updatedPrefix: '', // "Ανανεώθηκε: "
+  perMonth: '', // "/ μήνα"
+};
+const LABELS_KEY = `sgLabels_${(document.documentElement.lang || 'el').split('-')[0]}`;
+let labelsDirty = false;
 
-function buildCard(item, prefix) {
-  const link = document.createElement('a');
-  link.className = 'sg-v02-card';
-  link.href = prefix ? `/aggelia/${prefix}${item.id}` : '#';
-  link.target = '_blank';
-  link.rel = 'noopener';
-
-  const img = document.createElement('img');
-  img.className = 'sg-v02-card__img';
-  img.loading = 'lazy';
-  img.src = item.mainImageURL || '';
-  img.alt = '';
-  link.appendChild(img);
-
-  const body = document.createElement('div');
-  body.className = 'sg-v02-card__body';
-
-  const price = document.createElement('div');
-  price.className = 'sg-v02-card__price';
-  const priceStr =
-    typeof item.price === 'number'
-      ? `${item.price.toLocaleString('el-GR')}€${item.buy_or_rent === '1' ? ' / μήνα' : ''}`
-      : '—';
-  price.textContent = priceStr;
-  body.appendChild(price);
-
-  const meta = document.createElement('div');
-  meta.className = 'sg-v02-card__meta';
-  const bits = [];
-  if (item.sq_meters) bits.push(`${item.sq_meters} τ.μ.`);
-  if (item.floorNumber && item.floorNumber > 0) bits.push(`${item.floorNumber}ος ορ.`);
-  if (item.no_of_bathrooms)
-    bits.push(`${item.no_of_bathrooms} μπάνι${item.no_of_bathrooms > 1 ? 'α' : 'ο'}`);
-  meta.textContent = bits.join(' · ');
-  body.appendChild(meta);
-
-  const geo = document.createElement('div');
-  geo.className = 'sg-v02-card__geo';
-  geo.textContent = item.geography || '';
-  body.appendChild(geo);
-
-  link.appendChild(body);
-  return link;
-}
-
-function currentPageAggeliaIds() {
-  const ids = new Set();
-  document
-    .querySelectorAll('article.ordered-element a[href*="/aggelia/"]')
-    .forEach((a) => {
-      const match = (a.getAttribute('href') || '').match(/\/aggelia\/(\d+)/);
-      if (match) ids.add(match[1]);
+function loadLabels() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ [LABELS_KEY]: null }, (stored) => {
+      const saved = stored[LABELS_KEY];
+      if (saved) Object.assign(labels, saved);
+      resolve();
     });
-  return ids;
-}
-
-function renderConsolidatedSection(result) {
-  if (!result) return;
-
-  const existing = document.getElementById(SECTION_ID);
-  if (existing) existing.remove();
-
-  // Dedupe against listings already visible on the current page.
-  const skip = currentPageAggeliaIds();
-  const toRender = result.listings.filter((item) => {
-    const fullId = result.prefix ? `${result.prefix}${item.id}` : String(item.id);
-    return !skip.has(fullId);
   });
-
-  const section = document.createElement('section');
-  section.id = SECTION_ID;
-  section.className = 'sg-v02-consolidated';
-
-  const header = document.createElement('div');
-  header.className = 'sg-v02-consolidated__header';
-  header.textContent =
-    toRender.length > 0
-      ? `Επιπλέον ιδιωτικές αγγελίες από όλες τις σελίδες (${toRender.length})`
-      : 'Επιπλέον ιδιωτικές αγγελίες';
-  section.appendChild(header);
-
-  if (toRender.length === 0) {
-    const note = document.createElement('div');
-    note.className = 'sg-v02-consolidated__note';
-    note.textContent = result.privateCount === 0
-      ? 'Δεν βρέθηκαν ιδιωτικές αγγελίες σε αυτή την αναζήτηση.'
-      : 'Όλες οι ιδιωτικές αγγελίες φαίνονται ήδη σε αυτή τη σελίδα.';
-    section.appendChild(note);
-  } else {
-    const grid = document.createElement('div');
-    grid.className = 'sg-v02-consolidated__grid';
-    for (const item of toRender) {
-      grid.appendChild(buildCard(item, result.prefix));
-    }
-    section.appendChild(grid);
-  }
-
-  const resultsSection = document.querySelector('section.search-results__results');
-  if (resultsSection) {
-    resultsSection.after(section);
-  } else {
-    document.body.appendChild(section);
-  }
 }
 
-// ---- M3: secondary toggle UI ----
+function saveLabels() {
+  if (!labelsDirty) return;
+  labelsDirty = false;
+  chrome.storage.local.set({ [LABELS_KEY]: labels });
+}
+
+function formatPrice(value) {
+  return value.toLocaleString(document.documentElement.lang || 'el-GR');
+}
+
+function domCards() {
+  return Array.from(
+    document.querySelectorAll('article.ordered-element:not([data-sg-v02])')
+  );
+}
+
+function aggeliaIdOf(card) {
+  const href = card.querySelector('a[href*="/aggelia/"]')?.getAttribute('href') || '';
+  return href.match(/\/aggelia\/(\d+)/)?.[1] || null;
+}
+
+// A card's /aggelia/ link is a short category prefix followed by the listing's
+// own numeric id. Reading the prefix off a single card by suffix-matching is
+// tempting and wrong: across a thousand listings some other id is eventually a
+// suffix of this one's full id, and the match silently lands on the wrong
+// listing. The prefix is the same for every card in a search, so take the
+// answer the whole page agrees on.
+function derivePrefix(cards, byId) {
+  const tally = new Map();
+  for (const card of cards) {
+    const fullId = aggeliaIdOf(card);
+    if (!fullId) continue;
+    for (let length = 1; length <= 3; length++) {
+      if (!byId.has(fullId.slice(length))) continue;
+      const candidate = fullId.slice(0, length);
+      tally.set(candidate, (tally.get(candidate) || 0) + 1);
+      break;
+    }
+  }
+  let best = null;
+  let bestCount = 0;
+  for (const [prefix, count] of tally) {
+    if (count > bestCount) {
+      best = prefix;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+function learnFromDom(items) {
+  const byId = new Map(items.map((i) => [String(i.id), i]));
+  const set = (bag, key, value) => {
+    if (!value || bag[key] === value) return;
+    bag[key] = value;
+    labelsDirty = true;
+  };
+  const text = (el) => (el?.textContent || '').replace(/\s+/g, ' ').trim();
+
+  const cards = domCards();
+  const prefix = derivePrefix(cards, byId);
+  if (!prefix) return;
+
+  for (const card of cards) {
+    const fullId = aggeliaIdOf(card);
+    if (!fullId || !fullId.startsWith(prefix)) continue;
+    // A card the fetch didn't return (a boosted placement, say) simply has
+    // nothing to teach us.
+    const item = byId.get(fullId.slice(prefix.length));
+    if (!item) continue;
+
+    const kind = `${item.category}|${item.subtype}`;
+    set(labels.prefixes, `${item.category}|${item.buy_or_rent}`, prefix);
+    // "Διαμέρισμα, 40τ.μ." — the part before the comma is the subtype label.
+    set(labels.subs, kind, text(card.querySelector('.tile__title')).split(',')[0].trim());
+
+    // "€350 / μήνα" minus the formatted price leaves the per-month wording.
+    // Sale cards have no suffix and simply teach us nothing here.
+    const priceText = text(card.querySelector('.price__text'));
+    if (priceText && typeof item.price === 'number') {
+      const formatted = formatPrice(item.price);
+      const at = priceText.indexOf(formatted);
+      if (at >= 0) set(labels, 'perMonth', priceText.slice(at + formatted.length).trim());
+    }
+
+    const updated = card.querySelector('.tile__updated');
+    if (updated) {
+      // "Ανανεώθηκε: 25/07/2026" minus the <time> leaves the label.
+      const stamp = text(updated.querySelector('time'));
+      const whole = text(updated);
+      if (stamp && whole.endsWith(stamp)) {
+        set(labels, 'updatedPrefix', whole.slice(0, whole.length - stamp.length));
+      }
+    }
+
+    for (const li of card.querySelectorAll('.tile__info > li')) {
+      const icon = (li.querySelector('use')?.getAttribute('href') || '').split('#')[1];
+      if (!icon) continue;
+      // Each entry is <span><span>1</span> υ/δ</span> — the value in an inner
+      // span, the unit as a bare text node beside it, and the site's CSS puts
+      // them on separate lines. Keep the two apart or the unit reflows badly.
+      const outer = li.querySelector('span');
+      const lead = text(outer?.querySelector('span'));
+      if (!lead) continue;
+      const tail = text(outer).slice(lead.length).trim();
+
+      if (icon === 'i-icon-floor') {
+        // A pure enum: 3 → "ΙΣ", 4 → "ΗΜ", 6 → "1" + "ος".
+        if (item.floorNumber == null) continue;
+        const key = String(item.floorNumber);
+        if (labels.floors[key]?.lead !== lead || labels.floors[key]?.tail !== tail) {
+          labels.floors[key] = { lead, tail };
+          labelsDirty = true;
+        }
+        continue;
+      }
+      // The lead here is the listing's own count, so it teaches us nothing —
+      // but it does confirm we're reading the entry we think we are before
+      // taking the unit off the end.
+      const count = icon === 'i-icon-bedroom' ? item.rooms : item.no_of_bathrooms;
+      if (count && lead === String(count)) set(labels.units, icon, tail);
+    }
+  }
+  saveLabels();
+}
+
+function harvestSkin() {
+  // The site's card and paginator styles are Vue scoped CSS, keyed on a
+  // build-specific attribute. Copy the attribute names (and the icon sprite
+  // URL, which is also build-specific) off whatever the site rendered.
+  const card = domCards()[0] || null;
+  const tile = card?.querySelector('.tile') || null;
+  const nav = document.querySelector('nav.pagination:not([data-sg-v02])');
+  const icon = card?.querySelector('.tile__info svg');
+  const scopeOf = (el) =>
+    el ? Array.from(el.attributes).map((a) => a.name).find((n) => n.startsWith('data-v-')) || null : null;
+
+  return {
+    cardScope: scopeOf(card),
+    tileScope: scopeOf(tile),
+    pagScope: scopeOf(nav),
+    // Verbatim, because the modifier classes carry the geometry: in list view
+    // `tile--vip` is what sizes the thumbnail box, and gallery view swaps the
+    // whole set. Copying it is how one builder serves both views.
+    tileClass: tile?.className || 'tile tile--horizontal',
+    sprite: (icon?.querySelector('use')?.getAttribute('href') || '').split('#')[0] || '',
+    iconClass: icon?.getAttribute('class') || 'icon sprite-icons',
+    iconSize: icon?.getAttribute('width') || '23',
+  };
+}
+
+// ---- rendering the takeover ----
+
+// Our cards go into the site's card container as plain siblings of its own,
+// with no wrapper element. A wrapper would be tidier to remove, but the site
+// sizes its cards through direct-child selectors
+// (`.search-results__tile-row > article[data-v-…]`), and any element in
+// between silently drops the card to full width in gallery view. So the
+// marker attribute is what identifies ours, and removal sweeps by selector.
+const CARD_SELECTOR = 'article[data-sg-v02]';
+const PAGER_ID = 'sg-v02-pager';
+const NOTICE_ID = 'sg-v02-notice';
+const TAKEOVER_CLASS = 'sg-v02-takeover';
+const RESULTS_COLUMN = '.search-results__wrap-left';
+
+let currentResult = null;
+let currentPage = 1;
+let originalTotalText = null;
+
+function resultsColumn() {
+  return document.querySelector(RESULTS_COLUMN);
+}
+
+// List view and gallery view put the cards in different places — straight into
+// the results column, or into a `search-results__tile-row` flex container a
+// couple of levels down. Rather than special-case the two, take the site's own
+// first card as the anchor: whatever holds it is where ours belong too.
+function cardHostAnchors() {
+  const cards = domCards();
+  if (cards.length === 0) return null;
+  return { host: cards[0].parentElement, first: cards[0], last: cards[cards.length - 1] };
+}
+
+function pagerAnchor(host, lastCard) {
+  // Slot our paginator where the site's sits, but never inside its wrapper —
+  // the takeover CSS hides that wrapper, and it would take ours down with it.
+  // Climb to the wrapper's outermost node that's still a child of the host.
+  const siteNav = document.querySelector('nav.pagination:not([data-sg-v02])');
+  if (siteNav && host.contains(siteNav)) {
+    let node = siteNav;
+    while (node.parentElement && node.parentElement !== host) node = node.parentElement;
+    if (node.parentElement === host) return node;
+  }
+  return lastCard;
+}
+
+function buildCard(item, skin) {
+  const T = skin.tileScope;
+  const el = (tag, cls, scope = T) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (scope) node.setAttribute(scope, '');
+    return node;
+  };
+  const prefix = labels.prefixes[`${item.category}|${item.buy_or_rent}`];
+  const href = prefix ? `/aggelia/${prefix}${item.id}` : null;
+
+  const article = el('article', 'ordered-element', skin.cardScope);
+  article.setAttribute('data-sg-v02', '');
+  const tile = el('div', skin.tileClass);
+
+  const figure = el('figure', 'tile__img');
+  const imgWrap = el('div', 'img__wrap');
+  const imgLink = el('a', 'tile__link');
+  if (href) imgLink.href = href;
+  const img = el('img', '');
+  img.loading = 'lazy';
+  img.alt = '';
+  if (item.mainImageURL) img.src = item.mainImageURL;
+  imgLink.appendChild(img);
+  imgWrap.appendChild(imgLink);
+  figure.appendChild(imgWrap);
+  tile.appendChild(figure);
+
+  const content = el('div', 'tile__content');
+  const wrap = el('div', 'content__wrap');
+  const top = el('div', 'content__top');
+
+  const title = el('h3', 'tile__title');
+  // Falls back to bare "40τ.μ." for a subtype we've never seen rendered,
+  // rather than printing a raw numeric code at the user.
+  title.textContent = [
+    labels.subs[`${item.category}|${item.subtype}`],
+    item.sq_meters ? `${item.sq_meters}τ.μ.` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
+  top.appendChild(title);
+
+  const location = el('h3', 'tile__location');
+  location.textContent = item.geography || '';
+  top.appendChild(location);
+
+  // Only the card endpoint carries descriptions; on a wide search this is
+  // absent for every card alike, so the column stays internally consistent.
+  if (item.description) {
+    const description = el('p', 'tile__description');
+    description.textContent = item.description;
+    top.appendChild(description);
+  }
+
+  const extras = el('div', 'tile__extras');
+  const info = el('ul', 'tile__info');
+  const addInfo = (iconName, entry) => {
+    if (!entry?.lead) return;
+    const li = el('li', '');
+    if (skin.sprite) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('class', skin.iconClass);
+      svg.setAttribute('width', skin.iconSize);
+      svg.setAttribute('height', skin.iconSize);
+      if (T) svg.setAttribute(T, '');
+      const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+      use.setAttribute('href', `${skin.sprite}#${iconName}`);
+      svg.appendChild(use);
+      li.appendChild(svg);
+    }
+    const outer = el('span', '');
+    const inner = el('span', '');
+    inner.textContent = entry.lead;
+    outer.appendChild(inner);
+    if (entry.tail) outer.appendChild(document.createTextNode(` ${entry.tail} `));
+    li.appendChild(outer);
+    info.appendChild(li);
+  };
+  const counted = (iconName, count) =>
+    count ? { lead: String(count), tail: labels.units[iconName] || '' } : null;
+  addInfo('i-icon-floor', labels.floors[String(item.floorNumber)]);
+  addInfo('i-icon-bedroom', counted('i-icon-bedroom', item.rooms));
+  addInfo('i-icon-bathroom', counted('i-icon-bathroom', item.no_of_bathrooms));
+  extras.appendChild(info);
+
+  const updated = el('p', 'tile__updated');
+  const stamp = new Date((item.modified || '').replace(' ', 'T'));
+  if (!isNaN(stamp)) {
+    if (labels.updatedPrefix) updated.appendChild(document.createTextNode(labels.updatedPrefix));
+    const time = el('time', '');
+    const pad = (n) => String(n).padStart(2, '0');
+    time.textContent = `${pad(stamp.getDate())}/${pad(stamp.getMonth() + 1)}/${stamp.getFullYear()}`;
+    updated.appendChild(time);
+  }
+  extras.appendChild(updated);
+  top.appendChild(extras);
+  wrap.appendChild(top);
+
+  const bottom = el('div', 'content__bottom');
+  const price = el('div', 'tile__price');
+  const priceText = el('p', 'price__text');
+  if (typeof item.price === 'number') {
+    // buy_or_rent "1" is rent, and only rent gets a per-month suffix — which
+    // the site words in the current locale, so reuse whatever it used.
+    const suffix = item.buy_or_rent === '1' && labels.perMonth ? ` ${labels.perMonth}` : '';
+    priceText.textContent = `€${formatPrice(item.price)}${suffix}`;
+  }
+  price.appendChild(priceText);
+  bottom.appendChild(price);
+  wrap.appendChild(bottom);
+  content.appendChild(wrap);
+
+  // Full-card click target, same as the site's own overlay link.
+  const overlay = el('a', 'tile__link');
+  if (href) overlay.href = href;
+  content.appendChild(overlay);
+
+  tile.appendChild(content);
+  article.appendChild(tile);
+  return article;
+}
+
+function buildPager(pageCount, skin) {
+  const S = skin.pagScope;
+  const el = (tag, cls) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (S) node.setAttribute(S, '');
+    return node;
+  };
+
+  const nav = el('nav', 'pagination');
+  nav.id = PAGER_ID;
+  nav.setAttribute('data-sg-v02', '');
+  nav.setAttribute('aria-label', 'Pagination');
+  const list = el('ul', 'pagination b-pagination');
+
+  const addItem = (label, page, { disabled = false, active = false, arrow = false } = {}) => {
+    const li = el(
+      'li',
+      ['page-item', arrow ? 'page-arrow' : '', disabled ? 'disabled' : '', active ? 'active' : '']
+        .filter(Boolean)
+        .join(' ')
+    );
+    const link = el(disabled ? 'span' : 'a', 'page-link');
+    link.textContent = label;
+    if (!disabled) {
+      link.href = '#';
+      if (active) link.setAttribute('aria-current', 'page');
+      link.addEventListener('click', (event) => {
+        event.preventDefault();
+        goToPage(page);
+      });
+    }
+    li.appendChild(link);
+    list.appendChild(li);
+  };
+
+  addItem('‹', currentPage - 1, { arrow: true, disabled: currentPage === 1 });
+  // First, last, and a window around the current page — the same shape the
+  // site's own paginator uses, ellipsis and all.
+  const wanted = [1, pageCount, currentPage - 1, currentPage, currentPage + 1]
+    .filter((n) => n >= 1 && n <= pageCount)
+    .sort((a, b) => a - b);
+  let previous = 0;
+  for (const page of wanted) {
+    if (page === previous) continue;
+    if (page - previous > 1) addItem('…', 0, { disabled: true });
+    addItem(String(page), page, { active: page === currentPage });
+    previous = page;
+  }
+  addItem('›', currentPage + 1, { arrow: true, disabled: currentPage === pageCount });
+
+  nav.appendChild(list);
+  return nav;
+}
+
+function setResultsTotal(text) {
+  const heading = document.querySelector('.ordering__total h2');
+  if (!heading) return;
+  if (originalTotalText === null) originalTotalText = heading.textContent;
+  const next = text !== null ? text : originalTotalText;
+  // Only write on a real change: this heading is Vue's, and our own mutation
+  // wakes the observer that would otherwise write it again.
+  if (heading.textContent !== next) heading.textContent = next;
+}
+
+function removeInjectedNodes() {
+  document.querySelectorAll(CARD_SELECTOR).forEach((card) => card.remove());
+  document.getElementById(PAGER_ID)?.remove();
+  document.getElementById(NOTICE_ID)?.remove();
+}
+
+function buildNotice(message, retry) {
+  const notice = document.createElement('div');
+  notice.id = NOTICE_ID;
+  notice.className = 'sg-v02-notice';
+  const text = document.createElement('p');
+  text.className = 'sg-v02-notice__text';
+  text.textContent = message;
+  notice.appendChild(text);
+  if (retry) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sg-v02-notice__retry';
+    button.textContent = 'Δοκιμάστε ξανά';
+    button.addEventListener('click', retry);
+    notice.appendChild(button);
+  }
+  return notice;
+}
+
+function placeWithoutCards(column, node) {
+  const anchor =
+    column.querySelector('.search-results__tile-row') ||
+    column.querySelector('.ordering') ||
+    column.querySelector('h1');
+  // .after() rather than insertAdjacentElement: this also takes the document
+  // fragment the card batch arrives in.
+  if (anchor) anchor.after(node);
+  else column.appendChild(node);
+}
+
+function renderTakeover() {
+  const column = resultsColumn();
+  if (!column || !currentResult) return;
+
+  removeInjectedNodes();
+  column.classList.add(TAKEOVER_CLASS);
+
+  const skin = harvestSkin();
+  const listings = currentResult.listings;
+  const pageCount = Math.max(1, Math.ceil(listings.length / RESULTS_PER_PAGE));
+  if (currentPage > pageCount) currentPage = pageCount;
+
+  // Ours go in ahead of the site's own (hidden) cards, so the column reads
+  // top-down as our results followed by our paginator.
+  const anchors = cardHostAnchors();
+
+  if (listings.length === 0) {
+    const notice = buildNotice('Δεν βρέθηκαν ιδιωτικές αγγελίες σε αυτή την αναζήτηση.');
+    if (anchors) anchors.host.insertBefore(notice, anchors.first);
+    else placeWithoutCards(column, notice);
+    setResultsTotal('0 αποτελέσματα ιδιωτών');
+    return;
+  }
+
+  const batch = document.createDocumentFragment();
+  const start = (currentPage - 1) * RESULTS_PER_PAGE;
+  for (const item of listings.slice(start, start + RESULTS_PER_PAGE)) {
+    batch.appendChild(buildCard(item, skin));
+  }
+  const lastCard = batch.lastElementChild;
+
+  if (anchors) {
+    anchors.host.insertBefore(batch, anchors.first);
+    if (pageCount > 1) {
+      const after = pagerAnchor(anchors.host, anchors.last);
+      after.insertAdjacentElement('afterend', buildPager(pageCount, skin));
+    }
+  } else {
+    // No site cards to anchor to (a search that returned nothing of its own).
+    placeWithoutCards(column, batch);
+    if (pageCount > 1) lastCard?.insertAdjacentElement('afterend', buildPager(pageCount, skin));
+  }
+
+  setResultsTotal(`${listings.length} αποτελέσματα ιδιωτών`);
+}
+
+function goToPage(page) {
+  currentPage = page;
+  renderTakeover();
+  resultsColumn()?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function teardownTakeover() {
+  removeInjectedNodes();
+  resultsColumn()?.classList.remove(TAKEOVER_CLASS);
+  if (originalTotalText !== null) {
+    setResultsTotal(null);
+    originalTotalText = null;
+  }
+  currentResult = null;
+  currentPage = 1;
+}
+
+function renderConsolidationError(pageNumber, message, canonical) {
+  const column = resultsColumn();
+  if (!column) return;
+  removeInjectedNodes();
+  // Hand the column back on the way out: a failed fetch should leave the user
+  // with the site's own results and a note, not an empty page and a note.
+  column.classList.remove(TAKEOVER_CLASS);
+  const notice = buildNotice(
+    pageNumber != null
+      ? `Απέτυχε η συγκεντρωτική προβολή στη σελίδα ${pageNumber}: ${message}`
+      : `Απέτυχε η συγκεντρωτική προβολή: ${message}`,
+    () => {
+      cache.delete(canonical);
+      runConsolidation();
+    }
+  );
+  notice.classList.add('sg-v02-notice--error');
+  const anchors = cardHostAnchors();
+  if (anchors) anchors.host.insertBefore(notice, anchors.first);
+  else placeWithoutCards(column, notice);
+}
+
+// ---- toggle UI ----
 
 const V02_TOGGLE_ID = 'sg-v02-toggle';
 const V02_TOGGLE_LABEL = 'Δείξε όλες';
@@ -483,7 +961,7 @@ function updateV02ToggleUI(btn) {
       : V02_TOGGLE_LABEL;
   }
   btn.title = consolidateEnabled
-    ? 'Ενεργό — κλικ για να αφαιρέσεις τη συγκεντρωτική προβολή'
+    ? 'Ενεργό — κλικ για να επιστρέψεις στα αποτελέσματα του site'
     : 'Δείξε όλες τις ιδιωτικές αγγελίες από όλες τις σελίδες της αναζήτησης';
 }
 
@@ -497,51 +975,10 @@ async function onV02Click() {
     await runConsolidation();
   } else {
     if (activeController) activeController.abort();
-    removeConsolidatedSection();
+    teardownTakeover();
     v02Loading = false;
     updateV02ToggleUI();
   }
-}
-
-function removeConsolidatedSection() {
-  const existing = document.getElementById(SECTION_ID);
-  if (existing) existing.remove();
-}
-
-function renderConsolidationError(pageNumber, message, canonical) {
-  const existing = document.getElementById(SECTION_ID);
-  if (existing) existing.remove();
-
-  const section = document.createElement('section');
-  section.id = SECTION_ID;
-  section.className = 'sg-v02-consolidated sg-v02-consolidated--error';
-
-  const header = document.createElement('div');
-  header.className = 'sg-v02-consolidated__header';
-  header.textContent = 'Απέτυχε η συγκεντρωτική προβολή';
-  section.appendChild(header);
-
-  const note = document.createElement('div');
-  note.className = 'sg-v02-consolidated__note';
-  note.textContent =
-    pageNumber != null
-      ? `Σφάλμα στη σελίδα ${pageNumber}: ${message}`
-      : `Σφάλμα: ${message}`;
-  section.appendChild(note);
-
-  const retry = document.createElement('button');
-  retry.type = 'button';
-  retry.className = 'sg-v02-consolidated__retry';
-  retry.textContent = 'Δοκιμάστε ξανά';
-  retry.addEventListener('click', () => {
-    cache.delete(canonical);
-    runConsolidation();
-  });
-  section.appendChild(retry);
-
-  const resultsSection = document.querySelector('section.search-results__results');
-  if (resultsSection) resultsSection.after(section);
-  else document.body.appendChild(section);
 }
 
 async function runConsolidation() {
@@ -559,11 +996,14 @@ async function runConsolidation() {
       updateV02ToggleUI();
     });
     if (controller.signal.aborted) return;
-    renderConsolidatedSection(result);
+    if (!result) return;
+    currentResult = result;
+    currentPage = 1;
+    renderTakeover();
   } catch (err) {
     if (err?.name === 'AbortError') return;
     console.error('[SG-V02] fetch pipeline failed:', err);
-    // Report the failure in the site's own 30-per-page terms even though we
+    // Report the failure in the site's own 30-per-page terms even when we
     // fetch 300 at a time — "σελίδα 11" is something the user can locate.
     const pageNumber = err?.offset != null ? Math.floor(err.offset / 30) + 1 : null;
     renderConsolidationError(pageNumber, err?.message || String(err), canonicalizeUrl(location.href));
@@ -579,13 +1019,10 @@ async function runConsolidation() {
 console.log('[SG-V02] consolidate.js loaded');
 
 // Watch the DOM so we can (a) attach the v0.2 toggle once the v1 button
-// appears in the site's toolbar, (b) re-render if the v1 button state
-// flips (its button lives outside the search-results section but its
-// data-on attribute changes via v1's click handler — we listen to storage
-// events for that separately), and (c) detect Vue-driven navigation so
-// we invalidate the cache on a real search change or re-dedupe against
-// the newly visible page on a plain paginator click. Debounced at 250ms
-// so we run once after Vue's re-render settles, not on every mutation.
+// appears in the site's toolbar, (b) re-assert the takeover if Vue re-renders
+// the results column out from under it, and (c) detect Vue-driven navigation
+// so we re-fetch on a real search change. Debounced at 250ms so we run once
+// after Vue's re-render settles, not on every mutation.
 let v02DomTimer = null;
 new MutationObserver(() => {
   if (v02DomTimer) clearTimeout(v02DomTimer);
@@ -593,8 +1030,22 @@ new MutationObserver(() => {
     v02DomTimer = null;
     ensureV02Toggle();
     handlePossibleNav();
+    reassertTakeover();
   }, 250);
 }).observe(document.body, { childList: true, subtree: true });
+
+function reassertTakeover() {
+  // Vue owns the results column and will happily re-render our nodes away.
+  // Cheap to check, cheap to rebuild — and the fetch is cached, so a rebuild
+  // never costs network.
+  if (!consolidateEnabled || v02Loading || !currentResult) return;
+  if (!document.querySelector(CARD_SELECTOR) && !document.getElementById(NOTICE_ID)) {
+    renderTakeover();
+    return;
+  }
+  // Cards intact but Vue may still have redrawn the result count on its own.
+  setResultsTotal(`${currentResult.listings.length} αποτελέσματα ιδιωτών`);
+}
 
 function handlePossibleNav() {
   const currentHref = location.href;
@@ -604,22 +1055,16 @@ function handlePossibleNav() {
   lastFullHref = currentHref;
 
   if (!consolidateEnabled) return;
+  if (nowCanonical === prevCanonical) return;
 
-  if (nowCanonical !== prevCanonical) {
-    // Different search (base path or sort/filter param): drop the stale
-    // section, invalidate the previous canonical's cache entry so retrying
-    // that URL later re-fetches fresh data, cancel any in-flight fetch
-    // that was still targeting the old search, and re-run for the new URL.
-    cache.delete(prevCanonical);
-    if (activeController) activeController.abort();
-    removeConsolidatedSection();
-    runConsolidation();
-  } else {
-    // Same search, different /selida_N — the site re-rendered the grid,
-    // so re-run render for a fresh dedupe against the newly visible ids.
-    const cached = cache.get(nowCanonical);
-    if (cached) renderConsolidatedSection(cached);
-  }
+  // Different search (base path or sort/filter param): drop the stale view,
+  // invalidate the previous canonical's cache entry so retrying that URL later
+  // re-fetches fresh data, cancel any in-flight fetch that was still targeting
+  // the old search, and re-run for the new URL.
+  cache.delete(prevCanonical);
+  if (activeController) activeController.abort();
+  teardownTakeover();
+  runConsolidation();
 }
 
 // Also listen for v1's toggle flipping via storage changes.
@@ -627,8 +1072,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'sync') return;
   if (changes.filterEnabled) {
     ensureV02Toggle();
-    // If v1 is turned off, drop the consolidated section too.
-    if (!changes.filterEnabled.newValue) removeConsolidatedSection();
+    // v1 off hands the results column back to the site; v1 on again restores
+    // the consolidated view if it was on, which the cache makes free.
+    if (!changes.filterEnabled.newValue) teardownTakeover();
+    else if (consolidateEnabled && !currentResult) runConsolidation();
   }
   if (changes[V02_STORAGE_KEY]) {
     consolidateEnabled = !!changes[V02_STORAGE_KEY].newValue;
@@ -636,10 +1083,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-// Initial hydration: load persisted consolidateEnabled and, if on, run
-// consolidation once the site has settled.
+// Initial hydration: load persisted state and, if on, run consolidation once
+// the site has settled.
 chrome.storage.sync.get({ [V02_STORAGE_KEY]: false }, async (stored) => {
   consolidateEnabled = !!stored[V02_STORAGE_KEY];
+  await loadLabels();
   await new Promise((r) => setTimeout(r, 1500));
   ensureV02Toggle();
   if (consolidateEnabled) await runConsolidation();

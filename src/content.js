@@ -19,7 +19,12 @@ let filterEnabled = true;
 let debounceTimer = null;
 
 function getCards() {
-  return Array.from(document.querySelectorAll('article.ordered-element'));
+  // [data-sg-v02] cards are the consolidated view's own (src/consolidate.js).
+  // They're private listings by construction and their visibility belongs to
+  // that module, so this filter leaves them alone.
+  return Array.from(
+    document.querySelectorAll('article.ordered-element:not([data-sg-v02])')
+  );
 }
 
 function isPrivateListing(card) {

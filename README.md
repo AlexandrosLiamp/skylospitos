@@ -37,29 +37,67 @@ reload the document). It also hides the "Χρειάζεσαι τη βοήθει�
 ειδικού;" expert-banner card that agencies pay to place inside the results
 grid.
 
-## Consolidated view (v0.2)
+## Consolidated view
 
 Big searches spread the few private listings across many pages, and paging
 through them one at a time is the whole tedium the extension is trying to
-solve. As of v0.2 there's a second button, **"Δείξε όλες"**, that appears
-next to "Μόνο Ιδιώτες" once the filter is on. Click it and the extension
-fetches the whole current search directly from the site's own JSON API and
-appends every private listing from every page in a single section below the
-results grid. No pagination clicking, no reload.
+solve. There's a second button, **"Δείξε όλες"**, that appears next to "Μόνο
+Ιδιώτες" once the filter is on. Click it and the extension fetches the whole
+current search from the site's own JSON API, keeps the private listings, and
+**puts them in the results column in place of the site's own** — same cards,
+same paginator, re-paginated over the listings that are actually left.
 
-Practical details worth knowing before you turn it on:
+A worked example. This search:
+
+```
+/enoikiaseis-katoikies/patra/timi_eos-350/emvado_apo-35
+```
+
+is 961 listings across 32 pages, of which 58 are private. With the
+consolidated view on it becomes **2 pages of 30**, and page 1 of the site's
+own — which happens to be 30 agency listings and nothing else — stops being
+something you have to page past.
+
+### How it looks native
+
+The cards are built by the extension, not cloned from the page, but they
+carry the site's own class names *and* its Vue scoped-CSS attributes
+(`data-v-…`), which the extension reads off a live card at runtime. The
+site's stylesheet then draws them: same 320×240 thumbnail, same title,
+location, description, room icons, date and price, and the same layout in
+list view and gallery view. Nothing about the look is hardcoded, so a site
+restyle carries over on its own.
+
+The same trick covers the text the API doesn't carry. `subtype` comes back
+as a number and `floorNumber` as an enum (`3` → ΙΣ, `4` → ΗΜ, `6` → 1ος), so
+the extension pairs the ~30 cards the site has already rendered against
+their own API records and reads the labels off the page, remembering them in
+`chrome.storage.local`. That works in Greek and English alike, and doesn't
+rot when the site changes wording.
+
+The site's own paginator is hidden and replaced with one of ours, in the
+same markup and style. It doesn't touch the URL — paging is instant and
+doesn't make the site re-fetch anything.
+
+### Practical details worth knowing
 
 - It's opt-in and off by default. The v1 hide-agency-cards filter is
-  unchanged.
-- It reads the search from `/n_api/v1/properties/search-results-map`, the
-  endpoint behind the map's pins, rather than
-  `/n_api/v1/properties/search-results`, the one behind the card grid. Both
-  take the same query string and return the same listing objects — including
-  the `enquirerId` field that marks a private seller — but the map one hands
-  back **300 listings per request instead of 30**. On Πάτρα rentals that is
-  34 requests instead of 347, measured live at **~13 seconds** of "Φόρτωση…"
-  versus 5m51s when this was written against the card endpoint. Ν. Άρτας
-  rentals is a single request.
+  unchanged, and turning either one off puts the results column straight
+  back to the site's own.
+- Two endpoints back this, both taking the same query string as the search
+  itself and both returning the `enquirerId` field that marks a private
+  seller:
+  - `/n_api/v1/properties/search-results` — 30 per request, the one behind
+    the card grid. Includes each listing's description text.
+  - `/n_api/v1/properties/search-results-map` — 300 per request, the one
+    behind the map's pins. No descriptions.
+
+  A search that fits in 40 card-endpoint requests (~1200 listings, i.e.
+  anything you've actually narrowed down) uses the card endpoint, because
+  the descriptions are most of what makes the cards look right. Anything
+  wider switches to the map endpoint: unfiltered Πάτρα rentals is 34
+  requests that way instead of 347, measured live at ~13 seconds of
+  "Φόρτωση…" versus 5m51s.
 
   The two were checked for equivalence rather than assumed equal: on Ν.
   Άρτας both return the same 60 listings and the *same* 45 private ids, and
@@ -69,23 +107,21 @@ Practical details worth knowing before you turn it on:
   is unaffected.
 
   Requests go out in chunks of 6 with 200 ms between chunks, and the button
-  shows a live "N/34" counter so you can watch it work instead of staring at
+  shows a live "N/33" counter so you can watch it work instead of staring at
   a frozen spinner. Clicking the toggle again mid-fetch aborts. Results are
   deduplicated by listing id, because offset paging over a list that is
   still being edited can hand you the same listing twice.
+- The API answers in English unless asked otherwise, even on the Greek site,
+  so requests carry an `Accept-Language` header taken from `<html lang>`.
 - Fetching everything for a large city really does pay off. Πάτρα rentals
   returned 589 private listings, essentially all of them past page 20 (the
   site's default `sortBy=rankingscore` bubbles agency-boosted ads to the
   front, so a naïve first-page-only view misses the entire private tail).
 - Cache is per search URL and per sort — changing area, category or sort
-  drops the cache and re-fetches; clicking a plain paginator number
-  (/selida_2, /selida_3) reuses it.
-- If a fetch fails, you get a "Δοκιμάστε ξανά" retry button in the
-  section header. The extension does not auto-retry — a rate-limited
-  loop is how you get your IP blocked.
-- Cards in the consolidated section have a softer border than the site's
-  own so you can tell it's extension-added content, not part of
-  spitogatos.gr's own grid.
+  drops the cache and re-fetches.
+- If a fetch fails you get a "Δοκιμάστε ξανά" retry button where the results
+  would be. The extension does not auto-retry — a rate-limited loop is how
+  you get your IP blocked.
 
 ## Install
 
@@ -98,21 +134,28 @@ There's no Chrome Web Store listing. To install from source:
    [this rentals search in Ν. Άρτας](https://www.spitogatos.gr/enoikiaseis-katoikies/nomos-artas),
    and the toggle appears in the bottom-right.
 
-The extension only requests access to `https://www.spitogatos.gr/*` and
-stores one boolean. No network requests of its own, no telemetry, no
-background worker.
+The extension only requests access to `https://www.spitogatos.gr/*`. It
+stores two booleans (the two toggles) in `chrome.storage.sync` and the
+label vocabulary it learns from the page in `chrome.storage.local`. No
+telemetry, no background worker; the only network requests are the
+consolidated view's calls to spitogatos.gr's own API, and only when you
+turn it on.
 
 ## What it does NOT do
 
 - **Filter the map view's pins.** Only the list of cards is filtered.
   The map on the right still drops a pin for every listing regardless of
-  poster type. If you rely on the map to find neighborhoods, you'll still
-  see agency locations there.
+  poster type, including while the consolidated view is on. If you rely on
+  the map to find neighborhoods, you'll still see agency locations there.
+- **Reproduce every part of a site card.** The consolidated view's cards
+  have no photo carousel and no favourite / hide / compare buttons — those
+  are Vue components with their own state, and a dead-looking copy of them
+  would be worse than leaving them out. Clicking a card opens the listing as
+  usual.
 - **Anything server-side of its own.** Filtering is a pure DOM operation
-  in your browser. The v0.2 consolidated view calls spitogatos.gr's own
-  public search API (the same one the site's Vue app uses to draw the map),
-  but nothing about your search is sent anywhere else and there's no
-  telemetry.
+  in your browser. The consolidated view calls spitogatos.gr's own public
+  search API (the same one the site's Vue app uses), but nothing about your
+  search is sent anywhere else and there's no telemetry.
 
 ## Expected results by region
 
@@ -135,8 +178,8 @@ that the filter itself is running (the console will log
 manifest.json         MV3 manifest
 src/content.js        v1: detection, hiding, observer, "Μόνο Ιδιώτες" toggle
 src/styles.css        v1: toggle button styling
-src/consolidate.js    v0.2: API fetch, consolidated section, "Δείξε όλες" toggle
-src/consolidate.css   v0.2: secondary toggle + consolidated section + card grid
+src/consolidate.js    v0.3: API fetch, results-column takeover, "Δείξε όλες" toggle
+src/consolidate.css   v0.3: secondary toggle + takeover rules + notice states
 icons/                16 / 48 / 128 px placeholder icons
 PLAN.md               v1 build plan and site research notes
 PLAN_V02.md           v0.2 milestones, API research, non-goals
@@ -155,8 +198,9 @@ in `chrome://extensions/`. A page refresh alone doesn't pick up code
 changes — Chrome caches the loaded extension until you tell it to reload.
 
 There are no build steps, no dependencies, no bundler. v1 is about 130
-lines of JS + 50 lines of CSS; v0.2 adds another ~450 lines of JS + ~160
-lines of CSS on top.
+lines of JS + 50 lines of CSS; the consolidated view adds `src/consolidate.js`
+on top, which is roughly half comments — the site research behind each
+decision is written where the code that depends on it lives.
 
 ## Contributing
 

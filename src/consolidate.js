@@ -120,7 +120,11 @@ function findObservedSearchUrl() {
   const byPath = (path) =>
     entries.filter((e) => {
       try {
-        return new URL(e.name).pathname === path;
+        const url = new URL(e.name);
+        // Origin as well as path. This URL ends up in a credentialed fetch,
+        // and the resource timeline is not ours — anything else running in the
+        // page can put an entry in it.
+        return url.origin === location.origin && url.pathname === path;
       } catch {
         return false;
       }

@@ -110,10 +110,12 @@ function apiHeaders() {
   return { 'Accept-Language': base === lang ? lang : `${lang},${base};q=0.9` };
 }
 
-function findApiCallUrl(pathname) {
-  // Both endpoints are driven by the identical query string, so whichever of
-  // the two the site happened to fire, take its params and force the pathname
-  // we want.
+function findObservedSearchUrl() {
+  // Return whichever of the two search endpoints the site fired, exactly as it
+  // fired it. The value we're after is the query string — that's the search —
+  // and callers pick the pathname they want with withPath(). A fresh page load
+  // only fires the map one (the card data is server-rendered into the Nuxt
+  // payload), so accepting either is what makes this work on a cold load.
   const entries = performance.getEntriesByType('resource');
   const byPath = (path) =>
     entries.filter((e) => {
@@ -125,17 +127,14 @@ function findApiCallUrl(pathname) {
     });
 
   const hit = byPath(API_LIST_PATH).pop() || byPath(API_MAP_PATH).pop();
-  if (!hit) return null;
-  const u = new URL(hit.name);
-  u.pathname = pathname;
-  return u.toString();
+  return hit ? hit.name : null;
 }
 
 async function waitForApiCall(timeoutMs = 5000, pollMs = 150, signal) {
   const start = performance.now();
   while (performance.now() - start < timeoutMs) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const url = findApiCallUrl(API_LIST_PATH);
+    const url = findObservedSearchUrl();
     if (url) return url;
     await new Promise((r) => setTimeout(r, pollMs));
   }
@@ -375,8 +374,14 @@ let labelsDirty = false;
 function loadLabels() {
   return new Promise((resolve) => {
     chrome.storage.local.get({ [LABELS_KEY]: null }, (stored) => {
-      const saved = stored[LABELS_KEY];
-      if (saved) Object.assign(labels, saved);
+      // Losing the store is survivable — the next search relearns everything
+      // from the page — but silence here would look like the site changed its
+      // markup, so say which it was.
+      if (chrome.runtime.lastError) {
+        console.warn('[SG-V02] could not read learned labels:', chrome.runtime.lastError.message);
+      } else if (stored[LABELS_KEY]) {
+        Object.assign(labels, stored[LABELS_KEY]);
+      }
       resolve();
     });
   });
@@ -385,7 +390,11 @@ function loadLabels() {
 function saveLabels() {
   if (!labelsDirty) return;
   labelsDirty = false;
-  chrome.storage.local.set({ [LABELS_KEY]: labels });
+  chrome.storage.local.set({ [LABELS_KEY]: labels }, () => {
+    if (!chrome.runtime.lastError) return;
+    console.warn('[SG-V02] could not persist learned labels:', chrome.runtime.lastError.message);
+    labelsDirty = true; // let the next learning pass try again
+  });
 }
 
 function formatPrice(value) {
@@ -1038,12 +1047,22 @@ function reassertTakeover() {
   // Vue owns the results column and will happily re-render our nodes away.
   // Cheap to check, cheap to rebuild — and the fetch is cached, so a rebuild
   // never costs network.
+  // currentResult is null on every error path, which is what keeps this from
+  // fighting the retry notice renderConsolidationError leaves behind.
   if (!consolidateEnabled || v02Loading || !currentResult) return;
-  if (!document.querySelector(CARD_SELECTOR) && !document.getElementById(NOTICE_ID)) {
+  const column = resultsColumn();
+  if (!column) return;
+
+  const contentGone =
+    !document.querySelector(CARD_SELECTOR) && !document.getElementById(NOTICE_ID);
+  // The class is the half of the takeover that hides the site's own cards, so
+  // losing it alone is just as broken as losing ours — both sets would show at
+  // once. Treat either as a takeover to rebuild.
+  if (contentGone || !column.classList.contains(TAKEOVER_CLASS)) {
     renderTakeover();
     return;
   }
-  // Cards intact but Vue may still have redrawn the result count on its own.
+  // Intact, but Vue may still have redrawn the result count on its own.
   setResultsTotal(`${currentResult.listings.length} αποτελέσματα ιδιωτών`);
 }
 

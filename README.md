@@ -52,15 +52,18 @@ Practical details worth knowing before you turn it on:
 
 - It's opt-in and off by default. The v1 hide-agency-cards filter is
   unchanged.
-- Each search triggers up to N extra API calls, one per page of results,
-  spaced 200 ms apart. On a 3-page rentals search that's 3 calls; on a
-  20-page sales search in a big city that's 20. This is the same endpoint
-  the site's own Vue app already calls unauthenticated.
-- Hard cap: 20 pages / 600 listings. Anything past that is silently
-  truncated with a note. The cap exists so an ambitious search
-  ("Πάτρα ενοικίαση") doesn't spawn 50 requests in a row; if the cap
-  hits you a lot, `MAX_PAGES` in `src/consolidate.js` is one line to
-  change.
+- Each search triggers one extra API call per page of results, spaced
+  200 ms apart. On a 3-page rentals search that's 3 calls; on a 351-page
+  Πάτρα rentals search that's 351 calls and about 6 minutes of "Φόρτωση…"
+  before the section renders (measured live — the API slows down as
+  offset grows past ~5k, so total is ~1s/page not 500ms/page). This is
+  the same endpoint the site's own Vue app already calls unauthenticated.
+  Clicking the toggle again mid-fetch aborts.
+- Fetching every page for a large city really does pay off. Πάτρα
+  rentals returned 589 private listings out of 10,503 total, all of
+  them past page 20 (the site's default `sortBy=rankingscore` bubbles
+  agency-boosted ads to the front, so a naïve first-page-only view
+  misses the entire private tail).
 - Cache is per search URL and per sort — changing area, category or sort
   drops the cache and re-fetches; clicking a plain paginator number
   (/selida_2, /selida_3) reuses it.

@@ -32,7 +32,6 @@
 const API_LIST_PATH = '/n_api/v1/properties/search-results';
 const API_MAP_PATH = '/n_api/v1/properties/search-results-map';
 const PAGE_DELAY_MS = 200;
-const MAX_PAGES = 20;
 
 const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, lastPage }
 
@@ -164,9 +163,7 @@ async function fetchAllPagesForCurrentSearch(signal) {
   const backoffState = { tries: 0, delayMs: PAGE_DELAY_MS };
   const page1 = await fetchWithBackoff(apiUrl, 0, signal, backoffState);
   const perPage = page1.pagination?.perPage ?? 30;
-  const declaredLastPage = page1.pagination?.lastPage ?? 1;
-  const lastPage = Math.min(declaredLastPage, MAX_PAGES);
-  const truncated = declaredLastPage > MAX_PAGES;
+  const lastPage = page1.pagination?.lastPage ?? 1;
 
   const allListings = [...page1.data];
   for (let p = 2; p <= lastPage; p++) {
@@ -186,13 +183,12 @@ async function fetchAllPagesForCurrentSearch(signal) {
     privateCount: privateOnly.length,
     listings: privateOnly,
     lastPage,
-    truncated,
     prefix,
   };
   cache.set(canonical, result);
 
   console.log(
-    `[SG-V02] fetched ${lastPage} page${lastPage !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private (prefix="${prefix ?? '?'}")${truncated ? ` [truncated at ${MAX_PAGES}-page cap]` : ''}`
+    `[SG-V02] fetched ${lastPage} page${lastPage !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private (prefix="${prefix ?? '?'}")`
   );
   return result;
 }
@@ -296,13 +292,6 @@ function renderConsolidatedSection(result) {
       grid.appendChild(buildCard(item, result.prefix));
     }
     section.appendChild(grid);
-  }
-
-  if (result.truncated) {
-    const cap = document.createElement('div');
-    cap.className = 'sg-v02-consolidated__note';
-    cap.textContent = `Δείχνονται τα πρώτα ${MAX_PAGES * 30} αποτελέσματα. Περιορίστε την αναζήτηση για περισσότερα.`;
-    section.appendChild(cap);
   }
 
   const resultsSection = document.querySelector('section.search-results__results');

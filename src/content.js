@@ -3,6 +3,11 @@
 // hiding of the "expert-banner" agency ad card. Still driven by a
 // MutationObserver + trailing debounce so it survives client-side pagination
 // and sort changes, and an on-page toggle button persisted in chrome.storage.
+//
+// As of v0.4 this button is the extension's only control. src/consolidate.js
+// used to add a second one ("Δείξε όλες") for the consolidated view; the two
+// were really one decision, so consolidation now rides on `filterEnabled` and
+// consolidate.js reports its fetch progress back through setToggleProgress().
 
 const HIDDEN_ATTR = 'data-sg-hidden';
 const DEBOUNCE_MS = 150;
@@ -17,6 +22,10 @@ const SAVE_BTN_SELECTOR = '.listing-filters__save-btn';
 
 let filterEnabled = true;
 let debounceTimer = null;
+// Suffix consolidate.js hangs on the button label while it fetches ("5/33"),
+// or null when nothing is in flight. Hiding cards is instant; fetching every
+// page of a search is the only part slow enough to need a readout.
+let toggleProgress = null;
 
 function getCards() {
   // [data-sg-v02] cards are the consolidated view's own (src/consolidate.js).
@@ -101,7 +110,6 @@ function buildToggleButton() {
   btn.innerHTML =
     '<span class="sg-filter-toggle__dot"></span>' +
     '<span class="sg-filter-toggle__label"></span>';
-  btn.querySelector('.sg-filter-toggle__label').textContent = TOGGLE_LABEL;
   btn.addEventListener('click', toggleFilter);
   btn.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -117,9 +125,24 @@ function updateToggleUI(btn) {
   if (!btn) return;
   btn.setAttribute('data-on', filterEnabled ? 'true' : 'false');
   btn.setAttribute('aria-pressed', filterEnabled ? 'true' : 'false');
+  // aria-busy and a data attribute rather than `disabled`: a disabled button
+  // ignores clicks, and clicking off mid-fetch is how you cancel one.
+  btn.setAttribute('aria-busy', toggleProgress ? 'true' : 'false');
+  btn.toggleAttribute('data-loading', !!toggleProgress);
+  const label = btn.querySelector('.sg-filter-toggle__label');
+  if (label) {
+    label.textContent = toggleProgress ? `${TOGGLE_LABEL} ${toggleProgress}` : TOGGLE_LABEL;
+  }
   btn.title = filterEnabled
-    ? 'Φίλτρο ενεργό — κλικ για να δεις όλες τις αγγελίες'
-    : 'Φίλτρο ανενεργό — κλικ για μόνο ιδιώτες';
+    ? 'Ενεργό — μόνο αγγελίες ιδιωτών, από όλες τις σελίδες της αναζήτησης. Κλικ για όλες τις αγγελίες.'
+    : 'Κλικ για μόνο τις αγγελίες ιδιωτών, συγκεντρωμένες από όλες τις σελίδες';
+}
+
+// Called by src/consolidate.js. Takes the progress text to append to the
+// label ("5/33", "…") or null when nothing is in flight.
+function setToggleProgress(text) {
+  toggleProgress = text;
+  updateToggleUI();
 }
 
 function toggleFilter() {
@@ -151,8 +174,14 @@ function startObserver() {
 
 console.log('[SG-FILTER] content script loaded');
 
-chrome.storage.sync.get({ filterEnabled: true }, ({ filterEnabled: stored }) => {
-  filterEnabled = stored;
+chrome.storage.sync.get({ filterEnabled: true }, (stored) => {
+  // A failed read hands the callback nothing, not the defaults we asked for.
+  // On is the right thing to fall back to, but say so — otherwise it reads as
+  // the toggle having forgotten which way the user left it.
+  if (chrome.runtime.lastError) {
+    console.warn('[SG-FILTER] could not read the toggle state:', chrome.runtime.lastError.message);
+  }
+  filterEnabled = stored ? stored.filterEnabled : true;
   ensureToggleButton();
   applyFilter();
   startObserver();

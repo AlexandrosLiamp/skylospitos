@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Spitogatos – Μόνο Ιδιώτες",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Κρύβει τις αγγελίες μεσιτικών γραφείων στο spitogatos.gr και εμφανίζει μόνο αγγελίες ιδιωτών.",
   "permissions": ["storage"],
   "host_permissions": ["https://www.spitogatos.gr/*"],

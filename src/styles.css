@@ -23,7 +23,7 @@
   background-color: #ffffff;
   color: #333333;
   transition: background-color 0.15s ease, color 0.15s ease,
-              border-color 0.15s ease, transform 0.05s ease;
+              border-color 0.15s ease, transform 0.05s ease, opacity 0.15s ease;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -44,6 +44,13 @@
   background-color: #FE900A;
   color: #ffffff;
   border-color: #FE900A;
+}
+
+/* While consolidate.js is fetching the rest of the search. Still clickable —
+   clicking off is the cancel — so this only signals, it doesn't block. */
+.sg-filter-toggle[data-loading] {
+  cursor: progress;
+  opacity: 0.7;
 }
 
 .sg-filter-toggle__dot {

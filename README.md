@@ -20,11 +20,10 @@ what you don't want.
 
 ## What it does
 
-On any search-results page you get a small pill button in the bottom-right
-corner:
-
-- Teal when the filter is on.
-- Grey when it's off.
+On any search-results page you get one button, **"Μόνο Ιδιώτες"**, sitting
+in the site's own filter toolbar right after "Αποθήκευση" — orange when it's
+on, white when it's off. Pages that don't render that toolbar get the same
+button as a floating pill in the bottom-right corner instead.
 
 Click it to toggle. Your choice is remembered across page reloads, across
 the site's rentals / sales / other search categories, and (if you're signed
@@ -41,11 +40,16 @@ grid.
 
 Big searches spread the few private listings across many pages, and paging
 through them one at a time is the whole tedium the extension is trying to
-solve. There's a second button, **"Δείξε όλες"**, that appears next to "Μόνο
-Ιδιώτες" once the filter is on. Click it and the extension fetches the whole
-current search from the site's own JSON API, keeps the private listings, and
-**puts them in the results column in place of the site's own** — same cards,
-same paginator, re-paginated over the listings that are actually left.
+solve. So "Μόνο Ιδιώτες" doesn't just hide the agency cards on the page
+you're looking at: it fetches the whole current search from the site's own
+JSON API, keeps the private listings, and **puts them in the results column
+in place of the site's own** — same cards, same paginator, re-paginated over
+the listings that are actually left.
+
+That used to be a second button, "Δείξε όλες". Two buttons turned out to be
+one decision — nobody wants the private listings on this page but not the
+next one — so as of v0.4 there is one, and it shows its progress ("Μόνο
+Ιδιώτες 5/33") while the fetch runs.
 
 A worked example. This search:
 
@@ -79,11 +83,40 @@ The site's own paginator is hidden and replaced with one of ours, in the
 same markup and style. It doesn't touch the URL — paging is instant and
 doesn't make the site re-fetch anything.
 
+### Hovering a card still shows it on the map
+
+On the site, hovering a card lights up that listing's pin. The mechanism is
+one CSS class — the site puts `focused` on the marker and its own stylesheet
+draws the rest — and because the consolidated view's cards aren't Vue
+components, nothing bound that to them and the behaviour quietly went away.
+It's back, by two routes.
+
+Where the map already has a pin for the listing, hovering focuses it,
+exactly as the site would. On its own that covers very little: the map only
+pins the first 300 results of a search, in the site's ranking order, and
+private listings sit in the tail — 2 of the 30 cards on page one of the
+Πάτρα search above. So for the rest the extension drops a pin of its own at
+the listing's coordinates, cloned off one of the site's markers so it
+carries the same classes and scoped-CSS attribute and looks like every other
+pin. It goes away again when the pointer leaves, and nothing ever un-focuses
+a marker the extension didn't focus itself.
+
+Putting a pin at a coordinate means doing the map's own Web Mercator
+arithmetic, which the extension calibrates off the map rather than
+hardcoding: a loaded tile's URL says where in the world it belongs, its
+`transform` says where it actually landed, and the difference is the origin
+every pin is measured from. That re-reads itself on every hover, so panning
+and zooming need no bookkeeping. Checked against 220 of the site's own
+markers, the placement is a median 0.63px out, 3.05px at the 95th
+percentile.
+
 ### Practical details worth knowing
 
-- It's opt-in and off by default. The v1 hide-agency-cards filter is
-  unchanged, and turning either one off puts the results column straight
-  back to the site's own.
+- It's on by default, which is a change from v0.3, where consolidating was
+  a second button you had to press. One button means one default, and the
+  extension exists to show you the private listings — all of them, not the
+  ones that happen to be on page 1. Turning it off hands the results column
+  straight back to the site, mid-fetch included.
 - Two endpoints back this, both taking the same query string as the search
   itself and both returning the `enquirerId` field that marks a private
   seller:
@@ -96,8 +129,8 @@ doesn't make the site re-fetch anything.
   anything you've actually narrowed down) uses the card endpoint, because
   the descriptions are most of what makes the cards look right. Anything
   wider switches to the map endpoint: unfiltered Πάτρα rentals is 34
-  requests that way instead of 347, measured live at ~13 seconds of
-  "Φόρτωση…" versus 5m51s.
+  requests that way instead of 347, measured live at ~13 seconds of waiting
+  versus 5m51s.
 
   The two were checked for equivalence rather than assumed equal: on Ν.
   Άρτας both return the same 60 listings and the *same* 45 private ids, and
@@ -107,8 +140,8 @@ doesn't make the site re-fetch anything.
   is unaffected.
 
   Requests go out in chunks of 6 with 200 ms between chunks, and the button
-  shows a live "N/33" counter so you can watch it work instead of staring at
-  a frozen spinner. Clicking the toggle again mid-fetch aborts. Results are
+  counts them off — "Μόνο Ιδιώτες 5/33" — so you can watch it work instead
+  of staring at a frozen spinner. Clicking it off mid-fetch aborts. Results are
   deduplicated by listing id, because offset paging over a list that is
   still being edited can hand you the same listing twice.
 - The API answers in English unless asked otherwise, even on the Greek site,
@@ -132,14 +165,13 @@ There's no Chrome Web Store listing. To install from source:
 3. Click **Load unpacked** and select the folder.
 4. Visit any search on spitogatos.gr, for example
    [this rentals search in Ν. Άρτας](https://www.spitogatos.gr/enoikiaseis-katoikies/nomos-artas),
-   and the toggle appears in the bottom-right.
+   and the toggle appears in the filter toolbar above the results.
 
 The extension only requests access to `https://www.spitogatos.gr/*`. It
-stores two booleans (the two toggles) in `chrome.storage.sync` and the
-label vocabulary it learns from the page in `chrome.storage.local`. No
-telemetry, no background worker; the only network requests are the
-consolidated view's calls to spitogatos.gr's own API, and only when you
-turn it on.
+stores one boolean (the toggle) in `chrome.storage.sync` and the label
+vocabulary it learns from the page in `chrome.storage.local`. No telemetry,
+no background worker; the only network requests are the consolidated view's
+calls to spitogatos.gr's own API, and only while the toggle is on.
 
 ## What it does NOT do
 
@@ -147,6 +179,8 @@ turn it on.
   The map on the right still drops a pin for every listing regardless of
   poster type, including while the consolidated view is on. If you rely on
   the map to find neighborhoods, you'll still see agency locations there.
+  Hovering a card does light up where that listing is, but that's a
+  highlight drawn on the site's map, not a filtered map.
 - **Reproduce every part of a site card.** The consolidated view's cards
   have no photo carousel and no favourite / hide / compare buttons — those
   are Vue components with their own state, and a dead-looking copy of them
@@ -176,10 +210,10 @@ that the filter itself is running (the console will log
 
 ```
 manifest.json         MV3 manifest
-src/content.js        v1: detection, hiding, observer, "Μόνο Ιδιώτες" toggle
-src/styles.css        v1: toggle button styling
-src/consolidate.js    v0.3: API fetch, results-column takeover, "Δείξε όλες" toggle
-src/consolidate.css   v0.3: secondary toggle + takeover rules + notice states
+src/content.js        detection, hiding, observer, and the one toggle
+src/styles.css        toggle button styling
+src/consolidate.js    API fetch, results-column takeover, card-hover map pins
+src/consolidate.css   takeover rules + notice states
 icons/                16 / 48 / 128 px placeholder icons
 PLAN.md               v1 build plan and site research notes
 PLAN_V02.md           v0.2 milestones, API research, non-goals

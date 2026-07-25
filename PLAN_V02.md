@@ -13,6 +13,16 @@
 > draws them. See the header comment in `src/consolidate.js` and the README's
 > "Consolidated view" section for how that works. The 20-page cap in Milestone 5
 > is also gone — the endpoint choice in `planFetch` is what bounds the traffic now.
+>
+> **And further by v0.4.** The "second, opt-in mode" framing below is gone with
+> the second button. Hiding agency cards and fetching the rest of the search
+> were never really two decisions, so there is one toggle now — "Μόνο Ιδιώτες",
+> owned by `src/content.js` — and consolidation rides on its `filterEnabled`
+> state, reporting fetch progress back through `setToggleProgress()`. That makes
+> consolidation on by default, where the old `consolidateEnabled` key defaulted
+> off; the key is removed from sync storage on first run. v0.4 also gives the
+> takeover back the site's card-hover-highlights-the-pin behaviour, which the
+> takeover had silently dropped — see the map section of `src/consolidate.js`.
 
 ## What this adds
 

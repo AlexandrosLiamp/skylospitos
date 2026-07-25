@@ -1,4 +1,4 @@
-// Spitogatos v0.3 — consolidated view.
+// Spitogatos v0.4 — consolidated view.
 //
 // Runs alongside src/content.js in the same content-script isolated world.
 // See PLAN_V02.md at the repo root for the original feature plan.
@@ -8,6 +8,11 @@
 // them — the site's cards and paginator are hidden, ours stand in their place
 // re-paginated at the site's own 30-per-page. A search with 960 listings of
 // which 58 are private stops being 32 mostly-empty pages and becomes 2 full ones.
+//
+// There's no toggle of its own here. content.js owns the one button and the
+// `filterEnabled` state behind it; this file reads that state and reports fetch
+// progress back through setToggleProgress(). Both are top-level declarations in
+// a script the manifest loads first, which is what makes that legal.
 //
 // M0 research findings (2026-07-20), used by everything below:
 //
@@ -68,9 +73,14 @@
 //   and read the mapping straight off the page (learnFromDom), persisting what
 //   we learn so a rarely-seen subtype stays known.
 //
-//   Our cards go in a `display: contents` wrapper: one foreign node for Vue to
-//   patch around, but the cards themselves participate in the results column's
-//   own layout, so list view and gallery view both lay out natively.
+//   Our cards go in with no wrapper at all — see the comment above
+//   CARD_SELECTOR for why `display: contents` isn't an option.
+//
+// v0.4 research findings (2026-07-25):
+//
+//   Card-hover-highlights-the-pin is one CSS class, `focused`, that the site
+//   puts on the marker; see the map section below for how we pair a listing to
+//   a marker and what to do when the map has no pin for it.
 
 const API_LIST_PATH = '/n_api/v1/properties/search-results';
 const API_MAP_PATH = '/n_api/v1/properties/search-results-map';
@@ -570,6 +580,146 @@ function harvestSkin() {
   };
 }
 
+// ---- linking a card back to the site's map ----
+
+// Hovering a card on the site highlights that listing's pin. The mechanism is
+// a single class: the site puts `focused` on the marker and its own stylesheet
+// draws the highlight. Our cards aren't Vue components, so nothing ever bound
+// that behaviour to them and the takeover silently lost it.
+//
+// Giving it back takes two paths. Where the site already has a pin for the
+// listing we just focus it, exactly as the site would. That covers very little
+// on its own: the map pins the first 300 results of a search in ranking order,
+// and private listings sit in the tail — 2 of the 30 cards on page one of the
+// Πάτρα search (2026-07-25). For the rest we place a marker of our own at the
+// listing's coordinates, cloned off one of the site's so it carries the same
+// classes and Vue scope attribute.
+
+const MARKER_PANE = '.leaflet-marker-pane';
+const PIN_ATTR = 'data-sg-v02-pin'; // a marker of ours
+const BORROWED_ATTR = 'data-sg-v02-focus'; // one of the site's, focused by us
+
+function translateOf(el) {
+  // Leaflet positions with translate3d and only adds a scale() during a zoom
+  // animation, while every coordinate on the map is momentarily a lie.
+  const transform = el?.style.transform || '';
+  if (/scale\((?!1\))/.test(transform)) return null;
+  const at = transform.match(/translate3d\((-?[\d.]+)px,\s*(-?[\d.]+)px/);
+  return at ? { x: Number(at[1]), y: Number(at[2]) } : { x: 0, y: 0 };
+}
+
+function mapProjection() {
+  // Everything in the map's panes sits at a "layer point": the Web Mercator
+  // position of a coordinate at the current zoom, minus a fixed origin. A
+  // loaded tile hands us both — its URL ends in /{z}/{x}/{y}, which is where
+  // it belongs in the world, and its transform is where it actually landed. So
+  // this calibrates itself off the map's own state and needs no bookkeeping
+  // from us when the user pans or zooms.
+  const tile = document.querySelector('.leaflet-tile-pane img.leaflet-tile');
+  const zxy = (tile?.currentSrc || tile?.src || '')
+    .split('?')[0]
+    .match(/\/(\d+)\/(\d+)\/(\d+)\.[a-z0-9]+$/i);
+  const at = translateOf(tile);
+  // Tiles sit in a container of their own that the marker pane has no
+  // equivalent of, so its offset has to come back out.
+  const container = translateOf(tile?.parentElement);
+  if (!zxy || !at || !container) return null;
+
+  const tileSize = parseFloat(tile.style.width) || 256;
+  const world = tileSize * 2 ** Number(zxy[1]);
+  const originX = Number(zxy[2]) * tileSize - at.x - container.x;
+  const originY = Number(zxy[3]) * tileSize - at.y - container.y;
+  return (lat, lng) => ({
+    x: world * (0.5 + lng / 360) - originX,
+    y:
+      world * (0.5 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / (2 * Math.PI)) -
+      originY,
+  });
+}
+
+function markerPrototype() {
+  // Clone rather than build: marker markup carries a build-specific Vue scope
+  // attribute exactly like the cards do, and cloning inherits it for free.
+  // Which marker to clone is really the question "what would the site have
+  // drawn for a plain private listing?", so take the shape it drew most often.
+  // Cluster markers are excluded, and boosted-ad styling goes with them —
+  // those are a minority of a ranked list that our listings are never in.
+  const tally = new Map();
+  for (const marker of document.querySelectorAll(`${MARKER_PANE} .marker:not(.multiple)`)) {
+    const shape = marker.className.replace(/\bfocused\b/g, '').replace(/\s+/g, ' ').trim();
+    tally.set(shape, (tally.get(shape) || []).concat(marker));
+  }
+  let best = null;
+  for (const group of tally.values()) if (!best || group.length > best.length) best = group;
+  return best ? best[0].closest('.leaflet-marker-icon') : null;
+}
+
+function unfocusMap() {
+  document.querySelectorAll(`[${PIN_ATTR}]`).forEach((pin) => pin.remove());
+  // Only ever un-focus a marker we focused ourselves.
+  document.querySelectorAll(`[${BORROWED_ATTR}]`).forEach((marker) => {
+    marker.classList.remove('focused');
+    marker.removeAttribute(BORROWED_ATTR);
+  });
+}
+
+function focusOnMap(item, href) {
+  unfocusMap();
+  const pane = document.querySelector(MARKER_PANE);
+  if (!pane) return; // gallery view, or a page with no map at all
+
+  // The href is the only identifier a marker carries, and it's the same one we
+  // put on the card, so it's what pairs the two.
+  const own = href
+    ? Array.from(pane.querySelectorAll('a.marker__link'))
+        .find((link) => link.getAttribute('href') === href)
+        ?.closest('.marker')
+    : null;
+  if (own) {
+    own.classList.add('focused');
+    own.setAttribute(BORROWED_ATTR, '');
+    return;
+  }
+
+  const project = mapProjection();
+  const prototype = markerPrototype();
+  if (!project || !prototype || typeof item.latitude !== 'number') return;
+
+  const point = project(item.latitude, item.longitude);
+  const pin = prototype.cloneNode(true);
+  pin.setAttribute(PIN_ATTR, '');
+  // Nothing of ours should ever swallow a click meant for the map.
+  pin.classList.remove('leaflet-interactive');
+  pin.removeAttribute('tabindex');
+  pin.removeAttribute('role');
+  pin.style.pointerEvents = 'none';
+  pin.style.transform = `translate3d(${point.x}px, ${point.y}px, 0px)`;
+  // Above every marker Leaflet has placed. It stacks them by latitude, so
+  // there's no fixed number to beat.
+  pin.style.zIndex = String(
+    Math.max(0, ...Array.from(pane.children, (child) => Number(child.style.zIndex) || 0)) + 1
+  );
+
+  const marker = pin.querySelector('.marker');
+  if (marker) {
+    // exact / offset is the site's own wording for how precisely a listing is
+    // geocoded, and it draws the two differently.
+    marker.classList.remove('exact', 'offset');
+    marker.classList.add(item.geocodeType === 'offset' ? 'offset' : 'exact', 'focused');
+  }
+  // Only the boosted markers render a price bubble; keep the site's wording
+  // and swap the number, so this stays right in any locale.
+  const price = pin.querySelector('.marker__price');
+  if (price) {
+    price.textContent =
+      typeof item.price === 'number'
+        ? price.textContent.replace(/[\d.,]+/, formatPrice(item.price))
+        : '';
+  }
+  pin.querySelector('.marker__link')?.removeAttribute('href');
+  pane.appendChild(pin);
+}
+
 // ---- rendering the takeover ----
 
 // Our cards go into the site's card container as plain siblings of its own,
@@ -735,6 +885,13 @@ function buildCard(item, skin) {
 
   tile.appendChild(content);
   article.appendChild(tile);
+
+  // Hovering a card shows where the listing is, the way the site's own cards
+  // do. Bound here rather than delegated from the column because renderTakeover
+  // rebuilds these on every page turn, so they carry their own listeners.
+  article.addEventListener('mouseenter', () => focusOnMap(item, href));
+  article.addEventListener('mouseleave', unfocusMap);
+
   return article;
 }
 
@@ -807,6 +964,8 @@ function removeInjectedNodes() {
   document.querySelectorAll(CARD_SELECTOR).forEach((card) => card.remove());
   document.getElementById(PAGER_ID)?.remove();
   document.getElementById(NOTICE_ID)?.remove();
+  // A card removed under the pointer never gets its mouseleave.
+  unfocusMap();
 }
 
 function buildNotice(message, retry) {
@@ -924,98 +1083,41 @@ function renderConsolidationError(pageNumber, message, canonical) {
   else placeWithoutCards(column, notice);
 }
 
-// ---- toggle UI ----
+// ---- running, and reporting progress on the shared toggle ----
 
-const V02_TOGGLE_ID = 'sg-v02-toggle';
-const V02_TOGGLE_LABEL = 'Δείξε όλες';
-const V02_TOGGLE_LOADING = 'Φόρτωση…';
-const V02_STORAGE_KEY = 'consolidateEnabled';
-const V1_TOGGLE_ID = 'sg-filter-toggle';
+// There is one button, src/content.js owns it, and `filterEnabled` — declared
+// there — is the single on/off state for both halves of the extension. Content
+// scripts in the same isolated world share one global scope and the manifest
+// runs content.js first, so reading its state and calling setToggleProgress()
+// here is safe; it does mean the manifest's script order is load-bearing.
 
-let consolidateEnabled = false;
 let v02Loading = false;
 let v02Progress = null; // { fetched, total } during a fetch, else null
 let lastFullHref = location.href;
 let activeController = null;
 
-function ensureV02Toggle() {
-  // v0.2 button lives immediately after the v1 "Μόνο Ιδιώτες" button so
-  // both filter controls read as one toolbar group. Only shown when the
-  // v1 filter is on (nothing to consolidate if we're showing all listings).
-  const v1Btn = document.getElementById(V1_TOGGLE_ID);
-  if (!v1Btn) return; // v1 button not injected yet; will retry via observer
-  const v1On = v1Btn.getAttribute('data-on') === 'true';
-  const existing = document.getElementById(V02_TOGGLE_ID);
-
-  if (!v1On) {
-    if (existing) existing.remove();
-    return;
-  }
-
-  if (existing && existing.previousElementSibling === v1Btn) {
-    updateV02ToggleUI(existing);
-    return;
-  }
-
-  const btn = existing || buildV02Toggle();
-  v1Btn.insertAdjacentElement('afterend', btn);
-  updateV02ToggleUI(btn);
+function syncToggleProgress() {
+  setToggleProgress(
+    v02Loading ? (v02Progress ? `${v02Progress.fetched}/${v02Progress.total}` : '…') : null
+  );
 }
 
-function buildV02Toggle() {
-  const btn = document.createElement('button');
-  btn.id = V02_TOGGLE_ID;
-  btn.className = 'sg-v02-toggle';
-  btn.type = 'button';
-  btn.setAttribute('aria-pressed', 'false');
-  btn.innerHTML =
-    '<span class="sg-v02-toggle__dot"></span>' +
-    '<span class="sg-v02-toggle__label"></span>';
-  btn.addEventListener('click', onV02Click);
-  btn.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      onV02Click();
-    }
-  });
-  return btn;
-}
-
-function updateV02ToggleUI(btn) {
-  btn = btn || document.getElementById(V02_TOGGLE_ID);
-  if (!btn) return;
-  btn.setAttribute('data-on', consolidateEnabled ? 'true' : 'false');
-  btn.setAttribute('aria-pressed', consolidateEnabled ? 'true' : 'false');
-  // aria-busy + a data attribute for the loading state, not `disabled`:
-  // a disabled button ignores clicks, but we want the user to be able to
-  // cancel a running fetch by clicking off mid-load.
-  btn.setAttribute('aria-busy', v02Loading ? 'true' : 'false');
-  btn.toggleAttribute('data-loading', v02Loading);
-  const label = btn.querySelector('.sg-v02-toggle__label');
-  if (label) {
-    label.textContent = v02Loading
-      ? (v02Progress ? `${V02_TOGGLE_LOADING} ${v02Progress.fetched}/${v02Progress.total}` : V02_TOGGLE_LOADING)
-      : V02_TOGGLE_LABEL;
+// A page with no results column has nothing to take over. This matters more
+// now that consolidation is on by default and runs on every navigation, not
+// just when a button was pressed on a search page: `performance`'s resource
+// timeline survives the site's client-side navigation, so on a listing page
+// reached from a search, planFetch would find the search we came from and
+// re-fetch all of it before renderTakeover threw the lot away. Polled rather
+// than checked once, because on a client-side navigation Vue may not have
+// rendered the column yet by the time the observer fires.
+async function waitForResultsColumn(signal, timeoutMs = 3000, pollMs = 150) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    if (signal?.aborted) return false;
+    if (resultsColumn()) return true;
+    await new Promise((r) => setTimeout(r, pollMs));
   }
-  btn.title = consolidateEnabled
-    ? 'Ενεργό — κλικ για να επιστρέψεις στα αποτελέσματα του site'
-    : 'Δείξε όλες τις ιδιωτικές αγγελίες από όλες τις σελίδες της αναζήτησης';
-}
-
-async function onV02Click() {
-  // If loading and the click is turning consolidation ON again, ignore.
-  // Turning OFF mid-load is allowed and aborts the in-flight fetch.
-  if (v02Loading && !consolidateEnabled) return;
-  consolidateEnabled = !consolidateEnabled;
-  chrome.storage.sync.set({ [V02_STORAGE_KEY]: consolidateEnabled });
-  if (consolidateEnabled) {
-    await runConsolidation();
-  } else {
-    if (activeController) activeController.abort();
-    teardownTakeover();
-    v02Loading = false;
-    updateV02ToggleUI();
-  }
+  return false;
 }
 
 async function runConsolidation() {
@@ -1025,12 +1127,13 @@ async function runConsolidation() {
 
   v02Loading = true;
   v02Progress = null;
-  updateV02ToggleUI();
+  syncToggleProgress();
   try {
+    if (!(await waitForResultsColumn(controller.signal))) return;
     const result = await fetchAllPagesForCurrentSearch(controller.signal, (fetched, total) => {
       if (controller !== activeController) return;
       v02Progress = { fetched, total };
-      updateV02ToggleUI();
+      syncToggleProgress();
     });
     if (controller.signal.aborted) return;
     if (!result) return;
@@ -1048,24 +1151,22 @@ async function runConsolidation() {
     if (controller === activeController) {
       v02Loading = false;
       v02Progress = null;
-      updateV02ToggleUI();
+      syncToggleProgress();
     }
   }
 }
 
 console.log('[SG-V02] consolidate.js loaded');
 
-// Watch the DOM so we can (a) attach the v0.2 toggle once the v1 button
-// appears in the site's toolbar, (b) re-assert the takeover if Vue re-renders
-// the results column out from under it, and (c) detect Vue-driven navigation
-// so we re-fetch on a real search change. Debounced at 250ms so we run once
-// after Vue's re-render settles, not on every mutation.
+// Watch the DOM so we can (a) re-assert the takeover if Vue re-renders the
+// results column out from under it, and (b) detect Vue-driven navigation so we
+// re-fetch on a real search change. Debounced at 250ms so we run once after
+// Vue's re-render settles, not on every mutation.
 let v02DomTimer = null;
 new MutationObserver(() => {
   if (v02DomTimer) clearTimeout(v02DomTimer);
   v02DomTimer = setTimeout(() => {
     v02DomTimer = null;
-    ensureV02Toggle();
     handlePossibleNav();
     reassertTakeover();
   }, 250);
@@ -1077,7 +1178,7 @@ function reassertTakeover() {
   // never costs network.
   // currentResult is null on every error path, which is what keeps this from
   // fighting the retry notice renderConsolidationError leaves behind.
-  if (!consolidateEnabled || v02Loading || !currentResult) return;
+  if (!filterEnabled || v02Loading || !currentResult) return;
   const column = resultsColumn();
   if (!column) return;
 
@@ -1101,7 +1202,7 @@ function handlePossibleNav() {
   const nowCanonical = canonicalizeUrl(currentHref);
   lastFullHref = currentHref;
 
-  if (!consolidateEnabled) return;
+  if (!filterEnabled) return;
   if (nowCanonical === prevCanonical) return;
 
   // Different search (base path or sort/filter param): drop the stale view,
@@ -1114,28 +1215,36 @@ function handlePossibleNav() {
   runConsolidation();
 }
 
-// Also listen for v1's toggle flipping via storage changes.
+// The toggle lives in content.js, so its clicks reach us as storage changes.
+// (chrome.storage.onChanged fires in the writing context too, which is what
+// makes this work for the tab the user actually clicked in.)
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'sync') return;
-  if (changes.filterEnabled) {
-    ensureV02Toggle();
-    // v1 off hands the results column back to the site; v1 on again restores
-    // the consolidated view if it was on, which the cache makes free.
-    if (!changes.filterEnabled.newValue) teardownTakeover();
-    else if (consolidateEnabled && !currentResult) runConsolidation();
+  if (area !== 'sync' || !changes.filterEnabled) return;
+  if (changes.filterEnabled.newValue) {
+    runConsolidation();
+    return;
   }
-  if (changes[V02_STORAGE_KEY]) {
-    consolidateEnabled = !!changes[V02_STORAGE_KEY].newValue;
-    updateV02ToggleUI();
-  }
+  // Off hands the results column straight back to the site, and cancels an
+  // in-flight fetch — runConsolidation's own `finally` clears the progress
+  // readout once the abort lands.
+  if (activeController) activeController.abort();
+  teardownTakeover();
 });
 
 // Initial hydration: load persisted state and, if on, run consolidation once
 // the site has settled.
-chrome.storage.sync.get({ [V02_STORAGE_KEY]: false }, async (stored) => {
-  consolidateEnabled = !!stored[V02_STORAGE_KEY];
+chrome.storage.sync.get({ filterEnabled: true, consolidateEnabled: null }, async (stored) => {
+  // On a failed read the callback gets nothing at all, so fall back to the same
+  // defaults we asked for. Survivable, but log it: it would otherwise present
+  // as the toggle having silently forgotten which way the user left it.
+  if (chrome.runtime.lastError) {
+    console.warn('[SG-V02] could not read the toggle state:', chrome.runtime.lastError.message);
+  }
+  const state = stored || { filterEnabled: true, consolidateEnabled: null };
+  // v0.3 had a second toggle with a key of its own; one button now, so retire
+  // it rather than leaving a dead value in sync storage forever.
+  if (state.consolidateEnabled !== null) chrome.storage.sync.remove('consolidateEnabled');
   await loadLabels();
   await new Promise((r) => setTimeout(r, 1500));
-  ensureV02Toggle();
-  if (consolidateEnabled) await runConsolidation();
+  if (state.filterEnabled) await runConsolidation();
 });

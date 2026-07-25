@@ -418,27 +418,46 @@ function aggeliaIdOf(card) {
 // suffix of this one's full id, and the match silently lands on the wrong
 // listing. The prefix is the same for every card in a search, so take the
 // answer the whole page agrees on.
-function derivePrefix(cards, byId) {
-  const tally = new Map();
+function matchCardToItem(fullId, byId) {
+  // The prefix runs 1–3 characters, so try each length and see which leaves an
+  // id we actually fetched.
+  for (let length = 1; length <= 3; length++) {
+    const item = byId.get(fullId.slice(length));
+    if (item) return { item, prefix: fullId.slice(0, length) };
+  }
+  return null;
+}
+
+function derivePrefixes(cards, byId) {
+  // Tallied per category and listing type rather than once for the page: a
+  // search mixing two property types would otherwise hand the minority type
+  // the majority's prefix, and every card of that type would link somewhere
+  // wrong.
+  const tallies = new Map(); // "house|1" -> Map(prefix -> count)
   for (const card of cards) {
     const fullId = aggeliaIdOf(card);
     if (!fullId) continue;
-    for (let length = 1; length <= 3; length++) {
-      if (!byId.has(fullId.slice(length))) continue;
-      const candidate = fullId.slice(0, length);
-      tally.set(candidate, (tally.get(candidate) || 0) + 1);
-      break;
-    }
+    const match = matchCardToItem(fullId, byId);
+    if (!match) continue;
+    const key = `${match.item.category}|${match.item.buy_or_rent}`;
+    const counts = tallies.get(key) || new Map();
+    counts.set(match.prefix, (counts.get(match.prefix) || 0) + 1);
+    tallies.set(key, counts);
   }
-  let best = null;
-  let bestCount = 0;
-  for (const [prefix, count] of tally) {
-    if (count > bestCount) {
-      best = prefix;
-      bestCount = count;
+
+  const winners = new Map();
+  for (const [key, counts] of tallies) {
+    let best = null;
+    let bestCount = 0;
+    for (const [prefix, count] of counts) {
+      if (count > bestCount) {
+        best = prefix;
+        bestCount = count;
+      }
     }
+    if (best) winners.set(key, best);
   }
-  return best;
+  return winners;
 }
 
 function learnFromDom(items) {
@@ -451,19 +470,24 @@ function learnFromDom(items) {
   const text = (el) => (el?.textContent || '').replace(/\s+/g, ' ').trim();
 
   const cards = domCards();
-  const prefix = derivePrefix(cards, byId);
-  if (!prefix) return;
+  const prefixes = derivePrefixes(cards, byId);
 
   for (const card of cards) {
     const fullId = aggeliaIdOf(card);
-    if (!fullId || !fullId.startsWith(prefix)) continue;
+    if (!fullId) continue;
     // A card the fetch didn't return (a boosted placement, say) simply has
     // nothing to teach us.
-    const item = byId.get(fullId.slice(prefix.length));
-    if (!item) continue;
+    const match = matchCardToItem(fullId, byId);
+    if (!match) continue;
+    const { item, prefix } = match;
+
+    const key = `${item.category}|${item.buy_or_rent}`;
+    // Drop a match the rest of its category disagrees with: that's a false
+    // suffix hit on some other listing's id, not this card's own.
+    if (prefixes.get(key) !== prefix) continue;
 
     const kind = `${item.category}|${item.subtype}`;
-    set(labels.prefixes, `${item.category}|${item.buy_or_rent}`, prefix);
+    set(labels.prefixes, key, prefix);
     // "Διαμέρισμα, 40τ.μ." — the part before the comma is the subtype label.
     set(labels.subs, kind, text(card.querySelector('.tile__title')).split(',')[0].trim());
 

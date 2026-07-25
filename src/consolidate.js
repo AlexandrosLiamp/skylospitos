@@ -374,7 +374,11 @@ function updateV02ToggleUI(btn) {
   if (!btn) return;
   btn.setAttribute('data-on', consolidateEnabled ? 'true' : 'false');
   btn.setAttribute('aria-pressed', consolidateEnabled ? 'true' : 'false');
-  btn.disabled = v02Loading;
+  // aria-busy + a data attribute for the loading state, not `disabled`:
+  // a disabled button ignores clicks, but we want the user to be able to
+  // cancel a running fetch by clicking off mid-load.
+  btn.setAttribute('aria-busy', v02Loading ? 'true' : 'false');
+  btn.toggleAttribute('data-loading', v02Loading);
   const label = btn.querySelector('.sg-v02-toggle__label');
   if (label) label.textContent = v02Loading ? V02_TOGGLE_LOADING : V02_TOGGLE_LABEL;
   btn.title = consolidateEnabled

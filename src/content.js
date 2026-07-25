@@ -9,6 +9,11 @@ const DEBOUNCE_MS = 150;
 const TOGGLE_ID = 'sg-filter-toggle';
 const TOGGLE_LABEL = 'Μόνο Ιδιώτες';
 const PROMO_SELECTOR = '.expert-banner';
+// The site's own "Αποθήκευση" save-search button lives inside
+// .listing-filters__inner; we sit right after it so the toolbar reads
+// as one row of related controls.
+const TOOLBAR_SELECTOR = '.listing-filters__inner';
+const SAVE_BTN_SELECTOR = '.listing-filters__save-btn';
 
 let filterEnabled = true;
 let debounceTimer = null;
@@ -58,12 +63,36 @@ function applyFilter() {
 }
 
 function ensureToggleButton() {
-  if (document.getElementById(TOGGLE_ID)) return;
-  const btn = document.createElement('div');
+  const toolbar = document.querySelector(TOOLBAR_SELECTOR);
+  const saveBtn = toolbar ? toolbar.querySelector(SAVE_BTN_SELECTOR) : null;
+  const existing = document.getElementById(TOGGLE_ID);
+
+  // Preferred slot: immediately after the site's save-search button, inside
+  // the same flex row. If Vue re-rendered the toolbar and orphaned our
+  // button elsewhere, move it back into place rather than duplicating.
+  if (toolbar && saveBtn) {
+    if (existing && existing.previousElementSibling === saveBtn) return;
+    const btn = existing || buildToggleButton();
+    saveBtn.insertAdjacentElement('afterend', btn);
+    updateToggleUI(btn);
+    return;
+  }
+
+  // Fallback for pages that don't render the filter toolbar (defensive —
+  // v1 only ran on search results, but a floating button beats no button).
+  if (existing) return;
+  const btn = buildToggleButton();
+  btn.classList.add('sg-filter-toggle--floating');
+  updateToggleUI(btn);
+  (document.body || document.documentElement).appendChild(btn);
+}
+
+function buildToggleButton() {
+  const btn = document.createElement('button');
   btn.id = TOGGLE_ID;
   btn.className = 'sg-filter-toggle';
-  btn.setAttribute('role', 'button');
-  btn.setAttribute('tabindex', '0');
+  btn.type = 'button';
+  btn.setAttribute('aria-pressed', 'false');
   btn.innerHTML =
     '<span class="sg-filter-toggle__dot"></span>' +
     '<span class="sg-filter-toggle__label"></span>';
@@ -75,8 +104,7 @@ function ensureToggleButton() {
       toggleFilter();
     }
   });
-  updateToggleUI(btn);
-  (document.body || document.documentElement).appendChild(btn);
+  return btn;
 }
 
 function updateToggleUI(btn) {

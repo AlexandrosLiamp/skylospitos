@@ -669,6 +669,7 @@ let mapPins = []; // [{ el, items, lat, lng }] — one entry per cell, while the
 let mapPinsFor = null; // the result object they were built from
 let mapPinShape = null; // the marker class string last copied off the site
 let mapPaneObserver = null;
+let observedMapPane = null; // which map pane that observer is attached to
 let mapPlaceTimer = null;
 let originalMapCaption = null;
 
@@ -926,9 +927,16 @@ function placeMapPins() {
 }
 
 function watchMapPane() {
-  if (mapPaneObserver) return;
   const mapPane = document.querySelector(MAP_PANE);
   if (!mapPane) return;
+  // Re-observe when the map on the page is no longer the one we attached to.
+  // renderMapPins already expects the site to build a new map underneath us on
+  // a big enough view change (see ensureMapPins), and an observer left watching
+  // the pane that got thrown away never fires again — the pins would land once
+  // and then sit there through every later zoom.
+  if (mapPaneObserver && observedMapPane === mapPane) return;
+  mapPaneObserver?.disconnect();
+  observedMapPane = mapPane;
 
   // Panning writes a translate onto the map pane and leaves every layer point
   // alone; zooming resets it to zero and rewrites them all. Both arrive here as
@@ -1044,6 +1052,7 @@ function teardownMapPins() {
   document.documentElement.removeAttribute(MAP_TAKEOVER_ATTR);
   mapPaneObserver?.disconnect();
   mapPaneObserver = null;
+  observedMapPane = null;
   if (mapPlaceTimer) {
     clearTimeout(mapPlaceTimer);
     mapPlaceTimer = null;

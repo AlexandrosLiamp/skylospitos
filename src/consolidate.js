@@ -5,12 +5,19 @@
 //
 // M0 research findings (2026-07-20), used by everything below:
 //
-//   Endpoint: /n_api/v1/properties/search-results?…&offset={0,30,60,…}
-//     - 30 listings per page, JSON, no auth required.
-//     - Response: { data: [...], pagination: {currentPage, lastPage, offset,
-//                                             perPage, totalResults}, meta: {...} }
-//     - Rate: 6 rapid sequential calls succeeded in 1.8s with no throttling,
-//       ~300ms latency each. Using 200ms delay between calls as a good citizen.
+//   Endpoint: /n_api/v1/properties/search-results-map?…&offset={0,300,600,…}
+//     - 300 listings per request, JSON, no auth required. Same query string as
+//       the card endpoint, same property objects, 10x the page size.
+//     - Response: { data: { "<geohash>_exact": { properties: [...] }, … },
+//                   count, total }
+//     - The obvious-looking /search-results endpoint returns the same listings
+//       30 at a time and is what the card grid uses; we deliberately do not.
+//       On Πάτρα rentals that's 347 requests vs 34 for identical output
+//       (589 private listings either way, verified 2026-07-25). Sustained
+//       concurrency against the 347-request version drew HTTP 405 soft
+//       throttling from the server; the 34-request version does not.
+//     - offset paging is disjoint and stable (0 overlap across offsets
+//       0/300/600), and limit/perPage are ignored — 300 is a hard cap.
 //
 //   Per-item private flag: !!item.enquirerId
 //     - Matches DOM detection exactly: 17/30 on Arta rentals page 1 (matches
@@ -31,9 +38,12 @@
 
 const API_LIST_PATH = '/n_api/v1/properties/search-results';
 const API_MAP_PATH = '/n_api/v1/properties/search-results-map';
-const PAGE_DELAY_MS = 200;
+const MAP_PAGE_SIZE = 300; // the -map endpoint's own cap; limit/perPage are ignored, same as the card endpoint's 30
+const CHUNK_SIZE = 6;
+const CHUNK_DELAY_MS = 200;
+const BACKOFF_BASE_DELAY_MS = 200; // starting delay for the one-shot 429/405 backoff, not inter-request pacing
 
-const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, lastPage }
+const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, requests, prefix }
 
 function canonicalizeUrl(href) {
   // Group all /selida_N variants of the same search under one cache key,
@@ -50,11 +60,20 @@ function canonicalizeUrl(href) {
 }
 
 function findApiCallUrl() {
-  // Two related endpoints exist and both match a naive substring filter:
+  // Two related endpoints exist, both driven by the identical query string
+  // (the search itself); only the pathname differs:
   //   /search-results       — paginated card data, { data: [...], pagination, meta }
-  //   /search-results-map   — geo-bucketed pin data for the map, { data: {bucket:...}, count, total }
-  // We want the plain one. On some cold loads only the -map call has fired,
-  // so we fall back to it and rewrite its pathname (params are identical).
+  //   /search-results-map   — the map's pin data, { data: {bucket:...}, count, total }
+  //
+  // We want the -map one. It returns the same property objects as the card
+  // endpoint (same fields, including the enquirerId private flag) but 300 at
+  // a time instead of 30, which is the difference between 34 requests and 347
+  // on a city-sized search. Verified equivalent, not assumed: on Ν. Άρτας
+  // rentals both endpoints yield the same 60 listings and the exact same 45
+  // private ids; on Πάτρα rentals both yield the same 589 private listings.
+  //
+  // So whichever of the two the site happened to fire, take its params and
+  // force the pathname to -map.
   const entries = performance.getEntriesByType('resource');
   const byPath = (path) =>
     entries.filter((e) => {
@@ -65,16 +84,11 @@ function findApiCallUrl() {
       }
     });
 
-  const list = byPath(API_LIST_PATH).pop();
-  if (list) return list.name;
-
-  const map = byPath(API_MAP_PATH).pop();
-  if (map) {
-    const u = new URL(map.name);
-    u.pathname = API_LIST_PATH;
-    return u.toString();
-  }
-  return null;
+  const hit = byPath(API_MAP_PATH).pop() || byPath(API_LIST_PATH).pop();
+  if (!hit) return null;
+  const u = new URL(hit.name);
+  u.pathname = API_MAP_PATH;
+  return u.toString();
 }
 
 async function waitForApiCall(timeoutMs = 5000, pollMs = 150, signal) {
@@ -119,20 +133,33 @@ async function fetchPageByOffset(baseUrl, offset, signal) {
     err.offset = offset;
     throw err;
   }
-  return res.json();
+  const json = await res.json();
+
+  // The map endpoint groups listings into geohash buckets keyed by location
+  // ({ data: { "sqz3wd1p_exact": { properties: [...] }, … }, count, total }).
+  // Bucket identity only says where to drop a pin, which we never render, so
+  // flatten straight back to a plain listing array.
+  const items = [];
+  for (const bucket of Object.values(json.data || {})) {
+    if (Array.isArray(bucket?.properties)) items.push(...bucket.properties);
+  }
+  return { items, total: json.total ?? items.length };
 }
 
 async function fetchWithBackoff(apiUrl, offset, signal, backoffState) {
-  // One retry on 429 per session, with a growing delay. Anything else
-  // bubbles up to renderConsolidationError so the user can decide.
+  // One retry on 429/405 per session, with a growing delay. Anything else
+  // bubbles up to renderConsolidationError so the user can decide. 405 shows
+  // up alongside 429 when the server is throttling (see fetchChunkWithBackoff)
+  // — the opening request needs the same protection, since a throttled first
+  // request would otherwise fail the whole run instantly with no retry at all.
   try {
     return await fetchPageByOffset(apiUrl, offset, signal);
   } catch (err) {
-    if (err.status === 429 && backoffState.tries < 1) {
+    if ((err.status === 429 || err.status === 405) && backoffState.tries < 1) {
       backoffState.tries++;
       backoffState.delayMs = Math.min(backoffState.delayMs * 4, 2000);
       console.warn(
-        `[SG-V02] 429 at offset ${offset} — backing off to ${backoffState.delayMs}ms`
+        `[SG-V02] ${err.status} at offset ${offset} — backing off to ${backoffState.delayMs}ms`
       );
       await new Promise((r) => setTimeout(r, backoffState.delayMs));
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -142,7 +169,64 @@ async function fetchWithBackoff(apiUrl, offset, signal, backoffState) {
   }
 }
 
-async function fetchAllPagesForCurrentSearch(signal) {
+async function fetchChunkWithBackoff(apiUrl, offsets, signal, backoffState) {
+  // Concurrency means several offsets can 429 at once, so settle the whole
+  // batch before deciding anything. Abort is checked before classifying so an
+  // AbortError (which has no .status) never gets mistaken for a real failure.
+  const settled = await Promise.allSettled(
+    offsets.map((offset) => fetchPageByOffset(apiUrl, offset, signal))
+  );
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  const failures = [];
+  settled.forEach((r, i) => {
+    if (r.status === 'rejected') failures.push({ offset: offsets[i], err: r.reason });
+  });
+  if (failures.length === 0) return settled.map((r) => r.value);
+
+  // Lowest offset first so renderConsolidationError's page-number math points at
+  // the earliest failing page, matching how the old serial loop always died.
+  const lowest = (list) => list.reduce((a, b) => (a.offset <= b.offset ? a : b));
+
+  // 405 shows up alongside 429 when the live site throttles (confirmed
+  // empirically — a lone retry of a 405'd offset succeeds instantly, so it's a
+  // soft burst-throttle, not a real client error). Treat it the same as 429.
+  // This mattered a lot back when a city search meant 347 requests; at 34 it
+  // has not fired once, but it stays as cheap insurance.
+  const isThrottle = (status) => status === 429 || status === 405;
+  const realErrors = failures.filter((f) => !isThrottle(f.err?.status));
+  if (realErrors.length > 0) throw lowest(realErrors).err;
+
+  // Every failure is a throttle: one retry episode for the whole session, not per request.
+  if (backoffState.tries >= 1) throw lowest(failures).err;
+  backoffState.tries++;
+  backoffState.delayMs = Math.min(backoffState.delayMs * 4, 2000);
+  console.warn(
+    `[SG-V02] ${failures.length} × 429/405 in chunk — backing off to ${backoffState.delayMs}ms and retrying`
+  );
+  await new Promise((r) => setTimeout(r, backoffState.delayMs));
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  const retryOffsets = failures.map((f) => f.offset);
+  const retried = await Promise.allSettled(
+    retryOffsets.map((offset) => fetchPageByOffset(apiUrl, offset, signal))
+  );
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+  const retryFailures = [];
+  const retryValueByOffset = new Map();
+  retried.forEach((r, i) => {
+    if (r.status === 'rejected') retryFailures.push({ offset: retryOffsets[i], err: r.reason });
+    else retryValueByOffset.set(retryOffsets[i], r.value);
+  });
+  if (retryFailures.length > 0) throw lowest(retryFailures).err;
+
+  return settled.map((r, i) =>
+    r.status === 'fulfilled' ? r.value : retryValueByOffset.get(offsets[i])
+  );
+}
+
+async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
   const canonical = canonicalizeUrl(location.href);
   if (cache.has(canonical)) {
     console.log('[SG-V02] cache hit for', canonical);
@@ -152,7 +236,7 @@ async function fetchAllPagesForCurrentSearch(signal) {
   const apiUrl = await waitForApiCall(5000, 150, signal);
   if (!apiUrl) {
     console.warn(
-      '[SG-V02] never observed a /n_api/v1/properties/search-results call in 5s — page may not be a search results page'
+      '[SG-V02] never observed a /n_api/v1/properties/search-results[-map] call in 5s — page may not be a search results page'
     );
     return null;
   }
@@ -160,17 +244,40 @@ async function fetchAllPagesForCurrentSearch(signal) {
 
   console.log('[SG-V02] fetching all pages for', canonical);
 
-  const backoffState = { tries: 0, delayMs: PAGE_DELAY_MS };
-  const page1 = await fetchWithBackoff(apiUrl, 0, signal, backoffState);
-  const perPage = page1.pagination?.perPage ?? 30;
-  const lastPage = page1.pagination?.lastPage ?? 1;
+  const backoffState = { tries: 0, delayMs: BACKOFF_BASE_DELAY_MS };
+  const first = await fetchWithBackoff(apiUrl, 0, signal, backoffState);
+  const total = first.total;
+  const requests = Math.max(1, Math.ceil(total / MAP_PAGE_SIZE));
 
-  const allListings = [...page1.data];
-  for (let p = 2; p <= lastPage; p++) {
-    await new Promise((r) => setTimeout(r, backoffState.delayMs));
+  // Dedupe by id while collecting. Offset paging is a snapshot of a live list:
+  // if a listing is inserted between two requests every later offset shifts by
+  // one and the boundary listing comes back twice.
+  const seen = new Set();
+  const allListings = [];
+  const collect = (items) => {
+    for (const item of items) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      allListings.push(item);
+    }
+  };
+
+  collect(first.items);
+  onProgress(1, requests);
+
+  const remainingOffsets = [];
+  for (let o = MAP_PAGE_SIZE; o < total; o += MAP_PAGE_SIZE) remainingOffsets.push(o);
+
+  for (let i = 0; i < remainingOffsets.length; i += CHUNK_SIZE) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const pageData = await fetchWithBackoff(apiUrl, (p - 1) * perPage, signal, backoffState);
-    allListings.push(...pageData.data);
+    await new Promise((r) => setTimeout(r, CHUNK_DELAY_MS));
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    const chunkOffsets = remainingOffsets.slice(i, i + CHUNK_SIZE);
+    const chunkPages = await fetchChunkWithBackoff(apiUrl, chunkOffsets, signal, backoffState);
+    for (const page of chunkPages) collect(page.items);
+
+    onProgress(1 + Math.min(i + CHUNK_SIZE, remainingOffsets.length), requests);
   }
 
   const privateOnly = allListings.filter((i) => !!i.enquirerId);
@@ -182,13 +289,13 @@ async function fetchAllPagesForCurrentSearch(signal) {
     totalListings: allListings.length,
     privateCount: privateOnly.length,
     listings: privateOnly,
-    lastPage,
+    requests,
     prefix,
   };
   cache.set(canonical, result);
 
   console.log(
-    `[SG-V02] fetched ${lastPage} page${lastPage !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private (prefix="${prefix ?? '?'}")`
+    `[SG-V02] fetched ${requests} request${requests !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private (prefix="${prefix ?? '?'}")`
   );
   return result;
 }
@@ -312,6 +419,7 @@ const V1_TOGGLE_ID = 'sg-filter-toggle';
 
 let consolidateEnabled = false;
 let v02Loading = false;
+let v02Progress = null; // { fetched, total } during a fetch, else null
 let lastFullHref = location.href;
 let activeController = null;
 
@@ -369,7 +477,11 @@ function updateV02ToggleUI(btn) {
   btn.setAttribute('aria-busy', v02Loading ? 'true' : 'false');
   btn.toggleAttribute('data-loading', v02Loading);
   const label = btn.querySelector('.sg-v02-toggle__label');
-  if (label) label.textContent = v02Loading ? V02_TOGGLE_LOADING : V02_TOGGLE_LABEL;
+  if (label) {
+    label.textContent = v02Loading
+      ? (v02Progress ? `${V02_TOGGLE_LOADING} ${v02Progress.fetched}/${v02Progress.total}` : V02_TOGGLE_LOADING)
+      : V02_TOGGLE_LABEL;
+  }
   btn.title = consolidateEnabled
     ? 'Ενεργό — κλικ για να αφαιρέσεις τη συγκεντρωτική προβολή'
     : 'Δείξε όλες τις ιδιωτικές αγγελίες από όλες τις σελίδες της αναζήτησης';
@@ -438,19 +550,27 @@ async function runConsolidation() {
   const controller = activeController;
 
   v02Loading = true;
+  v02Progress = null;
   updateV02ToggleUI();
   try {
-    const result = await fetchAllPagesForCurrentSearch(controller.signal);
+    const result = await fetchAllPagesForCurrentSearch(controller.signal, (fetched, total) => {
+      if (controller !== activeController) return;
+      v02Progress = { fetched, total };
+      updateV02ToggleUI();
+    });
     if (controller.signal.aborted) return;
     renderConsolidatedSection(result);
   } catch (err) {
     if (err?.name === 'AbortError') return;
     console.error('[SG-V02] fetch pipeline failed:', err);
+    // Report the failure in the site's own 30-per-page terms even though we
+    // fetch 300 at a time — "σελίδα 11" is something the user can locate.
     const pageNumber = err?.offset != null ? Math.floor(err.offset / 30) + 1 : null;
     renderConsolidationError(pageNumber, err?.message || String(err), canonicalizeUrl(location.href));
   } finally {
     if (controller === activeController) {
       v02Loading = false;
+      v02Progress = null;
       updateV02ToggleUI();
     }
   }

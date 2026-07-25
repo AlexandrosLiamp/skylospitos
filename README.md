@@ -44,7 +44,8 @@ solve. So "Μόνο Ιδιώτες" doesn't just hide the agency cards on the pa
 you're looking at: it fetches the whole current search from the site's own
 JSON API, keeps the private listings, and **puts them in the results column
 in place of the site's own** — same cards, same paginator, re-paginated over
-the listings that are actually left.
+the listings that are actually left. As of v0.5 the map beside them is taken
+over the same way, so the agencies are gone from both halves of the page.
 
 That used to be a second button, "Δείξε όλες". Two buttons turned out to be
 one decision — nobody wants the private listings on this page but not the
@@ -83,32 +84,53 @@ The site's own paginator is hidden and replaced with one of ours, in the
 same markup and style. It doesn't touch the URL — paging is instant and
 doesn't make the site re-fetch anything.
 
-### Hovering a card still shows it on the map
+### The map shows the private listings too
 
-On the site, hovering a card lights up that listing's pin. The mechanism is
-one CSS class — the site puts `focused` on the marker and its own stylesheet
-draws the rest — and because the consolidated view's cards aren't Vue
-components, nothing bound that to them and the behaviour quietly went away.
-It's back, by two routes.
+Filtering the column and leaving the map alone doesn't get rid of the
+agencies — it moves them to the right-hand side of the screen. So the map gets
+the same treatment as the column: the site's pins are hidden, and the extension
+draws its own, one for every private listing in the consolidated result.
 
-Where the map already has a pin for the listing, hovering focuses it,
-exactly as the site would. On its own that covers very little: the map only
-pins the first 300 results of a search, in the site's ranking order, and
-private listings sit in the tail — 2 of the 30 cards on page one of the
-Πάτρα search above. So for the rest the extension drops a pin of its own at
-the listing's coordinates, cloned off one of the site's markers so it
-carries the same classes and scoped-CSS attribute and looks like every other
-pin. It goes away again when the pointer leaves, and nothing ever un-focuses
-a marker the extension didn't focus itself.
+Just hiding the agency pins wouldn't have been enough, and the numbers are why.
+The site's map is a single request of the map endpoint: 300 listings, in the
+ranking order that floats boosted agency ads to the front. On the Πάτρα search
+above that's 300 of 937 listings, of which exactly **two** are private — while
+the search has 58. Hiding what isn't private would have traded a map full of
+the wrong pins for a map with two pins on it.
 
-Putting a pin at a coordinate means doing the map's own Web Mercator
-arithmetic, which the extension calibrates off the map rather than
-hardcoding: a loaded tile's URL says where in the world it belongs, its
-`transform` says where it actually landed, and the difference is the origin
-every pin is measured from. That re-reads itself on every hover, so panning
-and zooming need no bookkeeping. Checked against 220 of the site's own
-markers, the placement is a median 0.63px out, 3.05px at the 95th
-percentile.
+The pins are clones of the site's own markers, so they inherit its scoped-CSS
+attribute and its styling for free, including the size class it swaps as you
+zoom in. They group the way the site groups: the map endpoint buckets listings
+by 8-character geohash and draws one marker per bucket, a bucket of more than
+one becoming a count bubble instead of a pin. So 58 private listings become 54
+markers, four of them bubbles of two. Hovering a card still lights up its pin,
+and a pin links through to its listing.
+
+Two things about where a marker goes took measuring:
+
+- **Not the listing's coordinates — the middle of its geohash cell.** Checked
+  against 220 of the site's own markers, the cell centre is 0.28px out at the
+  median where the coordinates themselves are 1.37px, and that gap doubles with
+  every zoom level.
+- **A listing marked `offset` is drawn 100 metres due north.** That's the site's
+  flag for a location it isn't willing to be precise about, and it displaces the
+  pin rather than the data. Measured at 99.9m median across the 11 such markers
+  on that map, and it's a distance on the ground rather than a nudge on the
+  screen — the pixel gap doubles per zoom level, 3.3px at z12 through 53.3px at
+  z16.
+
+With both applied the pins land within 0.7px of where the site would have put
+them, at every zoom from 11 to 18.
+
+Placing a pin at a coordinate means doing the map's own Web Mercator arithmetic,
+which the extension calibrates off the map rather than hardcoding: a loaded
+tile's URL says where in the world it belongs, its `transform` says where it
+actually landed, and the difference is the origin every pin is measured from.
+Panning is free — Leaflet moves the whole pane and every layer point stays
+valid — but a zoom rewrites all of them, so the pins re-place themselves
+whenever the map pane or its tiles change.
+
+Turning the toggle off puts the site's own pins back.
 
 ### Practical details worth knowing
 
@@ -175,12 +197,11 @@ calls to spitogatos.gr's own API, and only while the toggle is on.
 
 ## What it does NOT do
 
-- **Filter the map view's pins.** Only the list of cards is filtered.
-  The map on the right still drops a pin for every listing regardless of
-  poster type, including while the consolidated view is on. If you rely on
-  the map to find neighborhoods, you'll still see agency locations there.
-  Hovering a card does light up where that listing is, but that's a
-  highlight drawn on the site's map, not a filtered map.
+- **Give a count bubble anything to click.** Where two private listings share
+  a geohash cell the map draws one bubble with a "2" on it, and clicking it
+  does nothing. That's not a shortcut — the site's own bubbles are inert too,
+  verified by clicking one: no zoom, no re-centre, no popup. Both listings are
+  in the column either way.
 - **Reproduce every part of a site card.** The consolidated view's cards
   have no photo carousel and no favourite / hide / compare buttons — those
   are Vue components with their own state, and a dead-looking copy of them
@@ -212,7 +233,7 @@ that the filter itself is running (the console will log
 manifest.json         MV3 manifest
 src/content.js        detection, hiding, observer, and the one toggle
 src/styles.css        toggle button styling
-src/consolidate.js    API fetch, results-column takeover, card-hover map pins
+src/consolidate.js    API fetch, results-column takeover, map-pin takeover
 src/consolidate.css   takeover rules + notice states
 icons/                16 / 48 / 128 px placeholder icons
 PLAN.md               v1 build plan and site research notes

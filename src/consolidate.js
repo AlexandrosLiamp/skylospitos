@@ -415,6 +415,24 @@ function formatPrice(value) {
   return value.toLocaleString(document.documentElement.lang || 'el-GR');
 }
 
+// The two things a listing needs before it can be drawn as anything — a card
+// or a map pin — and both come out of what we learned off the page.
+function aggeliaHref(item) {
+  const prefix = labels.prefixes[`${item.category}|${item.buy_or_rent}`];
+  return prefix ? `/aggelia/${prefix}${item.id}` : null;
+}
+
+function listingTitle(item) {
+  // Falls back to a bare "40τ.μ." for a subtype we've never seen rendered,
+  // rather than printing a raw numeric code at the user.
+  return [
+    labels.subs[`${item.category}|${item.subtype}`],
+    item.sq_meters ? `${item.sq_meters}τ.μ.` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
+}
+
 function domCards() {
   return Array.from(
     document.querySelectorAll('article.ordered-element:not([data-sg-v02])')
@@ -580,24 +598,146 @@ function harvestSkin() {
   };
 }
 
-// ---- linking a card back to the site's map ----
+// ---- taking over the map's pins ----
 
-// Hovering a card on the site highlights that listing's pin. The mechanism is
-// a single class: the site puts `focused` on the marker and its own stylesheet
-// draws the highlight. Our cards aren't Vue components, so nothing ever bound
-// that behaviour to them and the takeover silently lost it.
+// The list is only half of a search. The map beside it draws a pin for every
+// listing no matter who posted it, so filtering the column and leaving the map
+// alone doesn't remove the agencies — it moves them to the right-hand side.
 //
-// Giving it back takes two paths. Where the site already has a pin for the
-// listing we just focus it, exactly as the site would. That covers very little
-// on its own: the map pins the first 300 results of a search in ranking order,
-// and private listings sit in the tail — 2 of the 30 cards on page one of the
-// Πάτρα search (2026-07-25). For the rest we place a marker of our own at the
-// listing's coordinates, cloned off one of the site's so it carries the same
-// classes and Vue scope attribute.
+// Hiding the agency pins is not enough on its own, and the numbers are why.
+// The site's map is one request of the map endpoint: 300 listings, in the
+// ranking order that floats boosted agency ads to the front. On
+// patra/timi_eos-350/emvado_apo-35 (2026-07-26) that's 300 of the search's 937
+// listings, and exactly 2 of them are private — while the search has 58. So
+// hiding what isn't private trades a map full of the wrong pins for a map with
+// two pins and 56 listings missing.
+//
+// The map therefore gets the same treatment as the results column: hide the
+// site's pins wholesale, draw our own for every private listing we fetched,
+// hand it all back on toggle-off. All 58 of them rather than 2 — 54 markers,
+// once the four that share a cell with another are grouped — and the map
+// finally agrees with the list beside it.
+//
+// Three things learned doing that against someone else's Leaflet:
+//
+//   Grouping. The map endpoint buckets listings by 8-character geohash
+//   ("sqz3werh_exact") and draws one marker per bucket, a bucket of more than
+//   one becoming a count bubble rather than a pin. Verified exactly: 250
+//   buckets against 250 markers, the 30 multi-buckets against the 30
+//   `.multiple` markers, their sizes summing to the counts drawn. We group the
+//   same way, bubbles included — they look like a dead end, but the site's own
+//   are inert too (clicking one changes no zoom, no centre, no popup), so
+//   reproducing one costs nothing that the original had.
+//
+//   Panning is free, zooming isn't. Leaflet pans by translating the whole map
+//   pane, so every layer point stays valid and our pins ride along untouched;
+//   a zoom resets that pane and rewrites all 250 marker transforms, and ours
+//   aren't Leaflet layers so nothing rewrites them. Hence watchMapPane().
+//
+//   Hide by stylesheet rule, not per node. A marker Leaflet adds after we've
+//   run is then hidden the moment it lands, rather than on our next pass.
 
 const MARKER_PANE = '.leaflet-marker-pane';
-const PIN_ATTR = 'data-sg-v02-pin'; // a marker of ours
+const MAP_PANE = '.leaflet-map-pane';
+const TILE_PANE = '.leaflet-tile-pane';
+// The site's own caption under the map — "Βλέπεις 300 απο 960 ακίνητα με pin
+// στο χάρτη". True of its map, false of ours, so it gets the same treatment as
+// the results heading: rewritten while we hold the map, put back afterwards.
+const MAP_CAPTION = '.map__pagination__inner';
+const MAP_TAKEOVER_ATTR = 'data-sg-v02-map'; // on <html>; consolidate.css hides the site's pins
+const PIN_ATTR = 'data-sg-v02-pin'; // one of ours, one per cell, for as long as the view is up
+const PIN_ID_ATTR = 'data-sg-v02-id'; // the listing ids it stands for, space-separated
+const HOVER_ATTR = 'data-sg-v02-hover'; // the transient hover pin, for when we own no map
 const BORROWED_ATTR = 'data-sg-v02-focus'; // one of the site's, focused by us
+const MAP_SETTLE_MS = 80;
+// Styling the site reserves for boosted ads. Ours are never boosted.
+const BOOSTED_CLASSES = ['topVip', 'vip', 'price-dropped'];
+
+const GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+const GEOHASH_PRECISION = 8; // what the map endpoint's own bucket keys use
+// A listing the API marks `geocodeType: "offset"` has a location it isn't
+// willing to be precise about, and the site draws it 100 metres due north of
+// the coordinates it reports. Measured against the 11 offset markers on the
+// Πάτρα map: 99.9m at the median, 99.6 to 100.5 across all of them. It's a
+// distance on the ground rather than a nudge on the screen — the pixel gap
+// doubles with every zoom level (3.3px at z12 through 53.3px at z16, ratios
+// 2.01 / 2.02 / 1.98 / 1.99) — which is why it's expressed in metres here.
+const OFFSET_METRES_NORTH = 100;
+const METRES_PER_DEGREE_LAT = 111320;
+
+let mapPins = []; // [{ el, items, lat, lng }] — one entry per cell, while the takeover is up
+let mapPinsFor = null; // the result object they were built from
+let mapPinShape = null; // the marker class string last copied off the site
+let mapPaneObserver = null;
+let mapPlaceTimer = null;
+let originalMapCaption = null;
+
+function setMapCaption(text) {
+  const caption = document.querySelector(MAP_CAPTION);
+  if (!caption) return;
+  if (originalMapCaption === null) originalMapCaption = caption.textContent;
+  const next = text !== null ? text : originalMapCaption;
+  // Same rule as setResultsTotal: only write on a real change, because this
+  // node is Vue's and our own mutation wakes the observer that would write it
+  // again.
+  if (caption.textContent !== next) caption.textContent = next;
+}
+
+function syncMapCaption() {
+  if (!mapPins.length) return;
+  const listings = mapPins.reduce((total, pin) => total + pin.items.length, 0);
+  setMapCaption(`Βλέπεις ${listings} ακίνητα ιδιωτών με pin στο χάρτη`);
+}
+
+function geohashCell(lat, lng) {
+  // Which bucket a listing falls in, and where its marker goes. The site draws
+  // a marker at the middle of the bucket's cell, not at any one listing's own
+  // coordinates: measured against 220 of its markers at zoom 14, the cell
+  // centre is 0.28px out at the median and 0.49px at the 95th, the listing's
+  // own coordinates 1.37px and 2.49px — and that gap doubles with every zoom
+  // level, so by street zoom it's the difference between the right building and
+  // the one over the road. Encoding checked against the endpoint's own keys:
+  // 300 of 300.
+  const latRange = [-90, 90];
+  const lngRange = [-180, 180];
+  let hash = '';
+  let evenBit = true;
+  let index = 0;
+  let bit = 0;
+  while (hash.length < GEOHASH_PRECISION) {
+    const range = evenBit ? lngRange : latRange;
+    const middle = (range[0] + range[1]) / 2;
+    if ((evenBit ? lng : lat) > middle) {
+      index = index * 2 + 1;
+      range[0] = middle;
+    } else {
+      index = index * 2;
+      range[1] = middle;
+    }
+    evenBit = !evenBit;
+    if (++bit === 5) {
+      hash += GEOHASH_BASE32[index];
+      index = 0;
+      bit = 0;
+    }
+  }
+  return {
+    hash,
+    lat: (latRange[0] + latRange[1]) / 2,
+    lng: (lngRange[0] + lngRange[1]) / 2,
+  };
+}
+
+function markerPoint(item) {
+  // Which marker a listing belongs to, and where on the map that marker goes.
+  const offset = item.geocodeType === 'offset';
+  const cell = geohashCell(item.latitude, item.longitude);
+  return {
+    key: `${cell.hash}_${offset ? 'offset' : 'exact'}`, // the endpoint's own bucket key
+    lat: cell.lat + (offset ? OFFSET_METRES_NORTH / METRES_PER_DEGREE_LAT : 0),
+    lng: cell.lng,
+  };
+}
 
 function translateOf(el) {
   // Leaflet positions with translate3d and only adds a scale() during a zoom
@@ -611,24 +751,46 @@ function translateOf(el) {
 function mapProjection() {
   // Everything in the map's panes sits at a "layer point": the Web Mercator
   // position of a coordinate at the current zoom, minus a fixed origin. A
-  // loaded tile hands us both — its URL ends in /{z}/{x}/{y}, which is where
-  // it belongs in the world, and its transform is where it actually landed. So
+  // loaded tile hands us both — its URL ends in /{z}/{x}/{y}, which is where it
+  // belongs in the world, and its transform is where it actually landed. So
   // this calibrates itself off the map's own state and needs no bookkeeping
   // from us when the user pans or zooms.
-  const tile = document.querySelector('.leaflet-tile-pane img.leaflet-tile');
-  const zxy = (tile?.currentSrc || tile?.src || '')
-    .split('?')[0]
-    .match(/\/(\d+)\/(\d+)\/(\d+)\.[a-z0-9]+$/i);
-  const at = translateOf(tile);
-  // Tiles sit in a container of their own that the marker pane has no
-  // equivalent of, so its offset has to come back out.
-  const container = translateOf(tile?.parentElement);
-  if (!zxy || !at || !container) return null;
+  //
+  // Every tile is polled rather than the first one, and the answer they mostly
+  // agree on wins. Through a zoom Leaflet keeps the outgoing level's tiles
+  // around next to the incoming one's, and a tile from the level being retired
+  // describes a projection that is about to stop being true.
+  const tally = new Map();
+  for (const tile of document.querySelectorAll(`${TILE_PANE} img.leaflet-tile`)) {
+    const zxy = (tile.currentSrc || tile.src || '')
+      .split('?')[0]
+      .match(/\/(\d+)\/(\d+)\/(\d+)\.[a-z0-9]+$/i);
+    const at = translateOf(tile);
+    // Tiles sit in a container of their own that the marker pane has no
+    // equivalent of, so its offset has to come back out.
+    const container = translateOf(tile.parentElement);
+    if (!zxy || !at || !container) continue;
 
-  const tileSize = parseFloat(tile.style.width) || 256;
-  const world = tileSize * 2 ** Number(zxy[1]);
-  const originX = Number(zxy[2]) * tileSize - at.x - container.x;
-  const originY = Number(zxy[3]) * tileSize - at.y - container.y;
+    const tileSize = parseFloat(tile.style.width) || 256;
+    const candidate = [
+      tileSize * 2 ** Number(zxy[1]),
+      Number(zxy[2]) * tileSize - at.x - container.x,
+      Number(zxy[3]) * tileSize - at.y - container.y,
+    ].join(' ');
+    tally.set(candidate, (tally.get(candidate) || 0) + 1);
+  }
+
+  let best = null;
+  let bestCount = 0;
+  for (const [candidate, count] of tally) {
+    if (count > bestCount) {
+      best = candidate;
+      bestCount = count;
+    }
+  }
+  if (!best) return null;
+
+  const [world, originX, originY] = best.split(' ').map(Number);
   return (lat, lng) => ({
     x: world * (0.5 + lng / 360) - originX,
     y:
@@ -637,26 +799,272 @@ function mapProjection() {
   });
 }
 
-function markerPrototype() {
+function isBoosted(className) {
+  return className.split(/\s+/).some((cls) => BOOSTED_CLASSES.includes(cls));
+}
+
+function markerPrototype(multiple = false) {
   // Clone rather than build: marker markup carries a build-specific Vue scope
   // attribute exactly like the cards do, and cloning inherits it for free.
   // Which marker to clone is really the question "what would the site have
-  // drawn for a plain private listing?", so take the shape it drew most often.
-  // Cluster markers are excluded, and boosted-ad styling goes with them —
-  // those are a minority of a ranked list that our listings are never in.
+  // drawn for an ordinary private listing?", so prefer the shape it drew most
+  // often among the unboosted ones, and settle for a boosted shape only if the
+  // whole map happens to be ads.
+  const selector = multiple ? '.marker.multiple' : '.marker:not(.multiple)';
   const tally = new Map();
-  for (const marker of document.querySelectorAll(`${MARKER_PANE} .marker:not(.multiple)`)) {
+  for (const marker of document.querySelectorAll(`${MARKER_PANE} ${selector}`)) {
+    if (marker.closest(`[${PIN_ATTR}], [${HOVER_ATTR}]`)) continue; // never clone our own
     const shape = marker.className.replace(/\bfocused\b/g, '').replace(/\s+/g, ' ').trim();
-    tally.set(shape, (tally.get(shape) || []).concat(marker));
+    if (!tally.has(shape)) tally.set(shape, []);
+    tally.get(shape).push(marker);
   }
+
   let best = null;
-  for (const group of tally.values()) if (!best || group.length > best.length) best = group;
-  return best ? best[0].closest('.leaflet-marker-icon') : null;
+  for (const [shape, group] of tally) {
+    const better =
+      !best ||
+      (isBoosted(best.shape) && !isBoosted(shape)) ||
+      (isBoosted(best.shape) === isBoosted(shape) && group.length > best.group.length);
+    if (better) best = { shape, group };
+  }
+  return best ? best.group[0].closest('.leaflet-marker-icon') : null;
 }
 
-function unfocusMap() {
+function normalisePinClasses(marker, item) {
+  // Everything about a marker's shape is the site's to decide except these:
+  // ours are never boosted ads, and exact / offset is the site's own wording
+  // for how precisely a listing is geocoded, which it draws differently.
+  marker.classList.remove('focused', 'exact', 'offset', ...BOOSTED_CLASSES);
+  marker.classList.add(item.geocodeType === 'offset' ? 'offset' : 'exact');
+}
+
+function syncPinShapes() {
+  // The site swaps a marker's size class as you zoom — `compact` low down,
+  // `medium` further in — so a pin built at one zoom is the wrong size at the
+  // next. Rather than keep our own list of which class names are sizes, copy
+  // the whole class string off a live marker and reapply the two parts that
+  // are ours to decide.
+  const shape = markerPrototype()?.querySelector('.marker')?.className;
+  if (!shape || shape === mapPinShape) return;
+  mapPinShape = shape;
+  const clusterShape = markerPrototype(true)?.querySelector('.marker')?.className;
+
+  for (const { el, items } of mapPins) {
+    const marker = el.querySelector('.marker');
+    // A cluster with no bubble on the map to copy keeps whatever it was built
+    // as; re-shaping it from the single-pin string would strip the `multiple`
+    // that makes its count render.
+    if (!marker || (items.length > 1 && !clusterShape)) continue;
+    const focused = marker.classList.contains('focused');
+    marker.className = items.length > 1 ? clusterShape : shape;
+    normalisePinClasses(marker, items[0]);
+    if (focused) marker.classList.add('focused');
+  }
+}
+
+function buildPin(items, prototype) {
+  const [item] = items;
+  const pin = prototype.cloneNode(true);
+  pin.setAttribute(PIN_ATTR, '');
+  pin.setAttribute(PIN_ID_ATTR, items.map((listing) => listing.id).join(' '));
+  // The icon div is a Leaflet click target with a role and a tabstop of its
+  // own, and neither survives the clone usefully — nothing listens on them any
+  // more. On a single pin the link inside is focusable and does the navigating,
+  // so let that be the only stop; a count bubble has nothing to navigate to, so
+  // it ends up with no tabstop at all, which is the honest answer for something
+  // that doesn't respond to being activated.
+  pin.removeAttribute('tabindex');
+  pin.removeAttribute('role');
+
+  const marker = pin.querySelector('.marker');
+  if (marker) normalisePinClasses(marker, item);
+  // Only the boosted markers carry a price bubble, and ours aren't boosted, so
+  // if the clone brought one along it goes with the classes that justified it.
+  pin.querySelector('.marker__price')?.remove();
+
+  const count = pin.querySelector('.marker__count');
+  if (count) count.textContent = String(items.length);
+
+  const link = pin.querySelector('.marker__link');
+  if (link) {
+    // A real count bubble has no link element to find, so this only runs for a
+    // group when we had no bubble to clone and fell back to the pin shape.
+    // Neither the link nor the label can be honest about several listings at
+    // once, so a group gets neither.
+    if (items.length === 1) {
+      const href = aggeliaHref(item);
+      if (href) link.setAttribute('href', href);
+      else link.removeAttribute('href');
+      // The site labels its own pins the same way ("Διαμέρισμα, 47 τ.μ.") —
+      // it's all a screen reader gets, since the pin itself is a coloured dot.
+      link.setAttribute('aria-label', listingTitle(item));
+    } else {
+      link.removeAttribute('href');
+      link.removeAttribute('aria-label');
+    }
+  }
+  return pin;
+}
+
+function placeMapPins() {
+  if (!mapPins.length) return false;
+  syncPinShapes();
+  const project = mapProjection();
+  // Null through a zoom animation, when every coordinate on the map is
+  // momentarily a lie, and before the first tile loads. Both resolve on their
+  // own, and the style changes that end them bring us back here.
+  if (!project) return false;
+
+  for (const { el, lat, lng } of mapPins) {
+    const point = project(lat, lng);
+    el.style.transform = `translate3d(${point.x}px, ${point.y}px, 0px)`;
+    // Leaflet stacks markers by how far south they are, so a pin overlaps the
+    // one behind it consistently rather than at random. Same rule for ours.
+    el.style.zIndex = String(Math.round(point.y));
+  }
+  return true;
+}
+
+function watchMapPane() {
+  if (mapPaneObserver) return;
+  const mapPane = document.querySelector(MAP_PANE);
+  if (!mapPane) return;
+
+  // Panning writes a translate onto the map pane and leaves every layer point
+  // alone; zooming resets it to zero and rewrites them all. Both arrive here as
+  // a style change, and re-placing a few dozen pins after a pan is cheap enough
+  // that telling the two apart isn't worth the code.
+  //
+  // The tile pane is watched as well, and it's the load-bearing half: right
+  // after a zoom the tiles for the new level are still arriving, so the first
+  // pass or two can read a projection that's still settling. Each tile that
+  // lands brings us back for another look, and the passes stop when the map
+  // does. Neither target contains our pins, so our own writes below don't
+  // retrigger this.
+  mapPaneObserver = new MutationObserver(() => {
+    if (mapPlaceTimer) clearTimeout(mapPlaceTimer);
+    mapPlaceTimer = setTimeout(() => {
+      mapPlaceTimer = null;
+      placeMapPins();
+    }, MAP_SETTLE_MS);
+  });
+  mapPaneObserver.observe(mapPane, { attributes: true, attributeFilter: ['style'] });
+  const tilePane = document.querySelector(TILE_PANE);
+  if (tilePane) {
+    mapPaneObserver.observe(tilePane, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'src'],
+    });
+  }
+}
+
+function removeMapPins() {
+  for (const { el } of mapPins) el.remove();
+  mapPins = [];
+  mapPinsFor = null;
+  mapPinShape = null; // freshly cloned pins get their shape checked again
+  // Belt and braces: a pin orphaned by a re-render is still ours to clear up.
   document.querySelectorAll(`[${PIN_ATTR}]`).forEach((pin) => pin.remove());
-  // Only ever un-focus a marker we focused ourselves.
+}
+
+function renderMapPins() {
+  const pane = document.querySelector(MARKER_PANE);
+  if (!pane || !currentResult) return false;
+
+  const prototype = markerPrototype();
+  // No prototype means the site drew no pins of its own — a map that hasn't
+  // loaded, or a search with nothing in it. Either way there's nothing to clone
+  // and nothing to improve on, and hiding a map we can't redraw is strictly
+  // worse than leaving it alone.
+  if (!prototype) return false;
+  // Bubbles are rarer, so a map can easily have none to clone. Falling back to
+  // the single-pin shape means a busy cell draws as one dot standing for
+  // several listings — the count is what's lost, not the location.
+  const clusterPrototype = markerPrototype(true) || prototype;
+
+  const pinned = currentResult.listings.filter(
+    (item) => typeof item.latitude === 'number' && typeof item.longitude === 'number'
+  );
+  if (!pinned.length) return false;
+
+  // One marker per bucket, the way the endpoint hands them to the site.
+  const cells = new Map();
+  for (const item of pinned) {
+    const { key, lat, lng } = markerPoint(item);
+    if (!cells.has(key)) cells.set(key, { items: [], lat, lng });
+    cells.get(key).items.push(item);
+  }
+
+  removeMapPins();
+  const batch = document.createDocumentFragment();
+  mapPins = Array.from(cells.values(), ({ items, lat, lng }) => {
+    const el = buildPin(items, items.length > 1 ? clusterPrototype : prototype);
+    batch.appendChild(el);
+    return { el, items, lat, lng };
+  });
+  if (!placeMapPins()) {
+    // No projection yet, so we don't know where any of them go. Drop them and
+    // let the next pass rebuild rather than piling 58 pins on the map's corner.
+    mapPins = [];
+    return false;
+  }
+
+  pane.appendChild(batch);
+  mapPinsFor = currentResult;
+  document.documentElement.setAttribute(MAP_TAKEOVER_ATTR, '');
+  syncMapCaption();
+  watchMapPane();
+  return true;
+}
+
+function ensureMapPins() {
+  if (!filterEnabled || !currentResult) return;
+  const pane = document.querySelector(MARKER_PANE);
+  if (!pane) return;
+  // Pins cover the whole result, not the page being shown, so paging through
+  // the column doesn't touch them. Rebuild only for a new result, or when
+  // something took ours off the map — checked against the pane that's on the
+  // page now rather than with isConnected, because a big enough view change
+  // has the site build a new map underneath us, and pins still attached to the
+  // old one are just as gone.
+  if (mapPinsFor === currentResult && mapPins.length && mapPins[0].el.parentElement === pane) {
+    return;
+  }
+  renderMapPins();
+}
+
+function teardownMapPins() {
+  removeMapPins();
+  if (originalMapCaption !== null) {
+    setMapCaption(null);
+    originalMapCaption = null;
+  }
+  document.documentElement.removeAttribute(MAP_TAKEOVER_ATTR);
+  mapPaneObserver?.disconnect();
+  mapPaneObserver = null;
+  if (mapPlaceTimer) {
+    clearTimeout(mapPlaceTimer);
+    mapPlaceTimer = null;
+  }
+}
+
+// Hovering a card on the site highlights that listing's pin. The mechanism is
+// a single class: the site puts `focused` on the marker and its own stylesheet
+// draws the highlight. Our cards aren't Vue components, so nothing ever bound
+// that behaviour to them and the takeover silently lost it.
+//
+// Normally the pin to light up is now one of ours. The two paths under that are
+// for when the map takeover didn't happen — no marker to clone, no projection
+// yet — where the site's own pins are still the ones on screen.
+
+function unfocusMap() {
+  document.querySelectorAll(`[${HOVER_ATTR}]`).forEach((pin) => pin.remove());
+  document
+    .querySelectorAll(`[${PIN_ATTR}] .marker.focused`)
+    .forEach((marker) => marker.classList.remove('focused'));
+  // Only ever un-focus a marker of the site's that we focused ourselves.
   document.querySelectorAll(`[${BORROWED_ATTR}]`).forEach((marker) => {
     marker.classList.remove('focused');
     marker.removeAttribute(BORROWED_ATTR);
@@ -668,8 +1076,18 @@ function focusOnMap(item, href) {
   const pane = document.querySelector(MARKER_PANE);
   if (!pane) return; // gallery view, or a page with no map at all
 
-  // The href is the only identifier a marker carries, and it's the same one we
-  // put on the card, so it's what pairs the two.
+  // Ours, which is the normal case. A card whose listing shares a cell with
+  // another lights up the bubble the two of them are drawn as.
+  const mine = mapPins
+    .find((pin) => pin.items.some((listing) => listing.id === item.id))
+    ?.el.querySelector('.marker');
+  if (mine) {
+    mine.classList.add('focused');
+    return;
+  }
+
+  // The href is the only identifier one of the site's markers carries, and it's
+  // the same one we put on the card, so it's what pairs the two.
   const own = href
     ? Array.from(pane.querySelectorAll('a.marker__link'))
         .find((link) => link.getAttribute('href') === href)
@@ -685,38 +1103,24 @@ function focusOnMap(item, href) {
   const prototype = markerPrototype();
   if (!project || !prototype || typeof item.latitude !== 'number') return;
 
-  const point = project(item.latitude, item.longitude);
-  const pin = prototype.cloneNode(true);
-  pin.setAttribute(PIN_ATTR, '');
-  // Nothing of ours should ever swallow a click meant for the map.
+  const where = markerPoint(item);
+  const point = project(where.lat, where.lng);
+  const pin = buildPin([item], prototype);
+  pin.removeAttribute(PIN_ATTR);
+  pin.setAttribute(HOVER_ATTR, '');
+  // This one is a highlight rather than a target — it lasts as long as the
+  // pointer is on the card — so nothing of ours should swallow a click meant
+  // for the map underneath.
   pin.classList.remove('leaflet-interactive');
-  pin.removeAttribute('tabindex');
-  pin.removeAttribute('role');
   pin.style.pointerEvents = 'none';
+  pin.querySelector('.marker__link')?.removeAttribute('href');
+  pin.querySelector('.marker')?.classList.add('focused');
   pin.style.transform = `translate3d(${point.x}px, ${point.y}px, 0px)`;
   // Above every marker Leaflet has placed. It stacks them by latitude, so
   // there's no fixed number to beat.
   pin.style.zIndex = String(
     Math.max(0, ...Array.from(pane.children, (child) => Number(child.style.zIndex) || 0)) + 1
   );
-
-  const marker = pin.querySelector('.marker');
-  if (marker) {
-    // exact / offset is the site's own wording for how precisely a listing is
-    // geocoded, and it draws the two differently.
-    marker.classList.remove('exact', 'offset');
-    marker.classList.add(item.geocodeType === 'offset' ? 'offset' : 'exact', 'focused');
-  }
-  // Only the boosted markers render a price bubble; keep the site's wording
-  // and swap the number, so this stays right in any locale.
-  const price = pin.querySelector('.marker__price');
-  if (price) {
-    price.textContent =
-      typeof item.price === 'number'
-        ? price.textContent.replace(/[\d.,]+/, formatPrice(item.price))
-        : '';
-  }
-  pin.querySelector('.marker__link')?.removeAttribute('href');
   pane.appendChild(pin);
 }
 
@@ -773,8 +1177,7 @@ function buildCard(item, skin) {
     if (scope) node.setAttribute(scope, '');
     return node;
   };
-  const prefix = labels.prefixes[`${item.category}|${item.buy_or_rent}`];
-  const href = prefix ? `/aggelia/${prefix}${item.id}` : null;
+  const href = aggeliaHref(item);
 
   const article = el('article', 'ordered-element', skin.cardScope);
   article.setAttribute('data-sg-v02', '');
@@ -798,14 +1201,7 @@ function buildCard(item, skin) {
   const top = el('div', 'content__top');
 
   const title = el('h3', 'tile__title');
-  // Falls back to bare "40τ.μ." for a subtype we've never seen rendered,
-  // rather than printing a raw numeric code at the user.
-  title.textContent = [
-    labels.subs[`${item.category}|${item.subtype}`],
-    item.sq_meters ? `${item.sq_meters}τ.μ.` : '',
-  ]
-    .filter(Boolean)
-    .join(', ');
+  title.textContent = listingTitle(item);
   top.appendChild(title);
 
   const location = el('h3', 'tile__location');
@@ -1019,6 +1415,9 @@ function renderTakeover() {
     if (anchors) anchors.host.insertBefore(notice, anchors.first);
     else placeWithoutCards(column, notice);
     setResultsTotal('0 αποτελέσματα ιδιωτών');
+    // Nothing to pin, so leave the map to the site rather than blanking it.
+    // An empty map reads as broken; the notice already says there's nothing.
+    teardownMapPins();
     return;
   }
 
@@ -1042,6 +1441,7 @@ function renderTakeover() {
   }
 
   setResultsTotal(`${listings.length} αποτελέσματα ιδιωτών`);
+  ensureMapPins();
 }
 
 function goToPage(page) {
@@ -1052,6 +1452,7 @@ function goToPage(page) {
 
 function teardownTakeover() {
   removeInjectedNodes();
+  teardownMapPins();
   resultsColumn()?.classList.remove(TAKEOVER_CLASS);
   if (originalTotalText !== null) {
     setResultsTotal(null);
@@ -1065,9 +1466,11 @@ function renderConsolidationError(pageNumber, message, canonical) {
   const column = resultsColumn();
   if (!column) return;
   removeInjectedNodes();
-  // Hand the column back on the way out: a failed fetch should leave the user
-  // with the site's own results and a note, not an empty page and a note.
+  // Hand the column and the map back on the way out: a failed fetch should
+  // leave the user the site's own results and a note, not an empty page and a
+  // note.
   column.classList.remove(TAKEOVER_CLASS);
+  teardownMapPins();
   const notice = buildNotice(
     pageNumber != null
       ? `Απέτυχε η συγκεντρωτική προβολή στη σελίδα ${pageNumber}: ${message}`
@@ -1193,6 +1596,12 @@ function reassertTakeover() {
   }
   // Intact, but Vue may still have redrawn the result count on its own.
   setResultsTotal(`${currentResult.listings.length} αποτελέσματα ιδιωτών`);
+  // The map loads on its own schedule and is usually still empty when the
+  // column is first taken over, so this is the retry: no markers to clone yet
+  // means renderMapPins declined, and it gets another go every time the DOM
+  // settles until it works.
+  ensureMapPins();
+  syncMapCaption();
 }
 
 function handlePossibleNav() {

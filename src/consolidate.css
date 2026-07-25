@@ -33,6 +33,25 @@ article[data-sg-v02] .img__wrap {
   background: #eef0f4;
 }
 
+/* ---- Consolidated view: taking over the map's pins ----
+
+   While the view is up the map shows its listings and nothing else. Doing this
+   as a rule rather than per node means a marker Leaflet adds afterwards is
+   hidden the moment it lands, instead of flashing until our next pass. The
+   attribute goes on <html>, which is the one element in the page that neither
+   Vue nor Leaflet has any reason to rewrite. */
+html[data-sg-v02-map] .leaflet-marker-pane .leaflet-marker-icon:not([data-sg-v02-pin]):not([data-sg-v02-hover]) {
+  display: none !important;
+}
+
+/* The site raises a hovered pin above its neighbours by reordering its own
+   Leaflet layers, which ours aren't part of. Cheaper to say it here than to
+   bookkeep two z-indexes per pin in JS — and !important is what beats the
+   inline z-index that placeMapPins writes. */
+.leaflet-marker-pane [data-sg-v02-pin]:has(.marker.focused) {
+  z-index: 10000 !important;
+}
+
 /* Empty state and fetch failures. Deliberately plain: the site has no
    equivalent element to borrow a look from. */
 .sg-v02-notice {

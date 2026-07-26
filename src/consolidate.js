@@ -169,12 +169,20 @@ function withPath(url, pathname) {
   return u.toString();
 }
 
+function atLeast(reported, held) {
+  // total decides how many further requests we make, so a reported figure that
+  // is missing, unusable, or smaller than the page already in hand has to lose
+  // to the page. Believing a 0 sitting next to thirty listings would end the
+  // fetch at page one and quietly show a fraction of the search.
+  return typeof reported === 'number' && reported > held ? reported : held;
+}
+
 function parseSearchResponse(json) {
   // Card endpoint: a plain array plus a pagination block.
   if (Array.isArray(json?.data)) {
     return {
       items: json.data,
-      total: json.pagination?.totalResults ?? json.data.length,
+      total: atLeast(json.pagination?.totalResults, json.data.length),
     };
   }
   // Map endpoint: listings grouped into geohash buckets keyed by location.
@@ -184,7 +192,7 @@ function parseSearchResponse(json) {
   for (const bucket of Object.values(json?.data || {})) {
     if (Array.isArray(bucket?.properties)) items.push(...bucket.properties);
   }
-  return { items, total: json?.total ?? items.length };
+  return { items, total: atLeast(json?.total, items.length) };
 }
 
 async function fetchPageByOffset(baseUrl, offset, signal) {
@@ -806,9 +814,14 @@ function markerPoint(item) {
 
 function translateOf(el) {
   // Leaflet positions with translate3d and only adds a scale() during a zoom
-  // animation, while every coordinate on the map is momentarily a lie.
+  // animation, while every coordinate on the map is momentarily a lie. Read the
+  // factor rather than its spelling: a scale of exactly 1 is not an animation,
+  // and 1, 1.0 and 1e0 are the same number written three ways. Anything that
+  // doesn't parse counts as animating, which is the safe direction — we skip a
+  // frame rather than place pins against coordinates we can't vouch for.
   const transform = el?.style.transform || '';
-  if (/scale\((?!1\))/.test(transform)) return null;
+  const scale = transform.match(/scale\(([^)]+)\)/);
+  if (scale && Number(scale[1]) !== 1) return null;
   const at = transform.match(/translate3d\((-?[\d.]+)px,\s*(-?[\d.]+)px/);
   return at ? { x: Number(at[1]), y: Number(at[2]) } : { x: 0, y: 0 };
 }

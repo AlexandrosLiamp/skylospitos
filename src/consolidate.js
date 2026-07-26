@@ -1577,6 +1577,22 @@ function openPinPopup(entry) {
   pane.appendChild(el);
   openPopup = { el, entry };
   placePopup();
+
+  // Placing reads the popup's own height, and the site's stylesheet gives the
+  // photo a box of a fixed size, so that height is final the moment the popup
+  // is in the document. That's the stylesheet's decision though, not ours: were
+  // a photo ever to size its own box, a popup sitting above a pin would stay
+  // where it was measured — too low by however much the photo added — and
+  // nothing would correct it, because the passes that re-place pins are driven
+  // by the map moving and an image loading isn't that. Re-place when they land.
+  for (const img of el.querySelectorAll('img')) {
+    if (img.complete) continue;
+    const settle = () => {
+      if (openPopup?.el === el) placePopup();
+    };
+    img.addEventListener('load', settle, { once: true });
+    img.addEventListener('error', settle, { once: true });
+  }
 }
 
 function bindPinPopup(entry) {

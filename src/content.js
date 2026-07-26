@@ -110,6 +110,11 @@ function buildToggleButton() {
   btn.innerHTML =
     '<span class="sg-filter-toggle__dot"></span>' +
     '<span class="sg-filter-toggle__label"></span>';
+  // Born with its text rather than waiting for the first updateToggleUI. Every
+  // path that appends the button calls that in the same task, so there's no
+  // frame where an empty label could be painted — but that's a property of the
+  // call order, and this is a property of the element.
+  btn.querySelector('.sg-filter-toggle__label').textContent = TOGGLE_LABEL;
   btn.addEventListener('click', toggleFilter);
   btn.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') {

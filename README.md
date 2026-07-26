@@ -99,12 +99,37 @@ the search has 58. Hiding what isn't private would have traded a map full of
 the wrong pins for a map with two pins on it.
 
 The pins are clones of the site's own markers, so they inherit its scoped-CSS
-attribute and its styling for free, including the size class it swaps as you
-zoom in. They group the way the site groups: the map endpoint buckets listings
-by 8-character geohash and draws one marker per bucket, a bucket of more than
-one becoming a count bubble instead of a pin. So 58 private listings become 54
-markers, four of them bubbles of two. Hovering a card still lights up its pin,
-and a pin links through to its listing.
+attribute and its styling for free. They group the way the site groups: the map
+endpoint buckets listings by 8-character geohash and draws one marker per
+bucket, a bucket of more than one becoming a count bubble instead of a pin. So
+58 private listings become 54 markers, four of them bubbles of two. Hovering a
+card still lights up its pin, and a pin links through to its listing.
+
+A marker isn't one shape, though — it's four, and the site swaps between them as
+you zoom. Zoomed out it's a coloured dot drawn in CSS; zoomed in, an exact
+location becomes a 22×28 teardrop with an SVG inside it while an approximate one
+stays a dot; a bubble carries a count where a pin carries a link. So a pin is
+re-cloned from whatever the site is drawing now rather than relabelled — moving
+the class across was the first thing tried and it makes every pin on the map
+vanish one zoom level in, because `.marker.medium` is written for a marker with
+an SVG in it and a dot relabelled `medium` has none.
+
+### Hovering a pin shows the listing
+
+The same as hovering one of the site's: a small card over the map with the photo,
+title, area, floor / rooms / baths and price, and a link through to the listing.
+A count bubble shows one card per listing at that point, under the same heading
+the site writes ("2 ακίνητα βρέθηκαν σε αυτό το σημείο").
+
+The popup is a Vue component of its own, and unlike a card or a marker there is
+never one in the page to copy from — it exists only while a marker is hovered.
+So the extension asks for one: the site's markers are hidden while the takeover
+is up, but they're still there and still bound, and a synthetic mouseover runs
+their handlers whether or not the node has a box to hover. Its two scope
+attributes get read off the result, which is then thrown away, and from there
+the site's stylesheet draws a popup the extension builds itself — the same
+bargain the cards are built on. The heading over a group is learned the same
+way, and remembered per locale like the rest of the wording.
 
 Two things about where a marker goes took measuring:
 
@@ -197,16 +222,16 @@ calls to spitogatos.gr's own API, and only while the toggle is on.
 
 ## What it does NOT do
 
-- **Give a count bubble anything to click.** Where two private listings share
-  a geohash cell the map draws one bubble with a "2" on it, and clicking it
-  does nothing. That's not a shortcut — the site's own bubbles are inert too,
-  verified by clicking one: no zoom, no re-centre, no popup. Both listings are
-  in the column either way.
-- **Reproduce every part of a site card.** The consolidated view's cards
-  have no photo carousel and no favourite / hide / compare buttons — those
-  are Vue components with their own state, and a dead-looking copy of them
-  would be worse than leaving them out. Clicking a card opens the listing as
-  usual.
+- **Give a count bubble anything to click.** Where two private listings share a
+  geohash cell the map draws one bubble with a "2" on it, and clicking it does
+  nothing — no zoom, no re-centre. That's not a shortcut; the site's own bubbles
+  don't respond to a click either, verified by clicking one. Hovering it lists
+  both listings, and both are in the column regardless.
+- **Reproduce every part of a site card.** The consolidated view's cards, and
+  the card inside a map popup, have no photo carousel and no favourite / hide /
+  compare buttons — those are Vue components with their own state, and a
+  dead-looking copy of them would be worse than leaving them out. Clicking
+  either opens the listing as usual.
 - **Anything server-side of its own.** Filtering is a pure DOM operation
   in your browser. The consolidated view calls spitogatos.gr's own public
   search API (the same one the site's Vue app uses), but nothing about your

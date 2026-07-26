@@ -381,6 +381,7 @@ const labels = {
   prefixes: {}, // "house|1"     -> "21"  (the /aggelia/ id prefix)
   updatedPrefix: '', // "Ανανεώθηκε: "
   perMonth: '', // "/ μήνα"
+  pointHeader: '', // "%d ακίνητα βρέθηκαν σε αυτό το σημείο"
 };
 const LABELS_KEY = `sgLabels_${(document.documentElement.lang || 'el').split('-')[0]}`;
 let labelsDirty = false;
@@ -431,6 +432,50 @@ function listingTitle(item) {
   ]
     .filter(Boolean)
     .join(', ');
+}
+
+// Floor, bedrooms, bathrooms, in the site's own icons and wording. The results
+// card and the map popup are different Vue components with different scope
+// attributes and icon sizes, but the list inside them is the same list, built
+// the same way.
+function buildInfoList(item, { listClass, scope, sprite, iconClass, iconSize }) {
+  const el = (tag, cls) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (scope) node.setAttribute(scope, '');
+    return node;
+  };
+
+  const info = el('ul', listClass);
+  const addInfo = (iconName, entry) => {
+    if (!entry?.lead) return;
+    const li = el('li', '');
+    if (sprite) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('class', iconClass);
+      svg.setAttribute('width', iconSize);
+      svg.setAttribute('height', iconSize);
+      if (scope) svg.setAttribute(scope, '');
+      const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+      use.setAttribute('href', `${sprite}#${iconName}`);
+      svg.appendChild(use);
+      li.appendChild(svg);
+    }
+    const outer = el('span', '');
+    const inner = el('span', '');
+    inner.textContent = entry.lead;
+    outer.appendChild(inner);
+    if (entry.tail) outer.appendChild(document.createTextNode(` ${entry.tail} `));
+    li.appendChild(outer);
+    info.appendChild(li);
+  };
+  const counted = (iconName, count) =>
+    count ? { lead: String(count), tail: labels.units[iconName] || '' } : null;
+
+  addInfo('i-icon-floor', labels.floors[String(item.floorNumber)]);
+  addInfo('i-icon-bedroom', counted('i-icon-bedroom', item.rooms));
+  addInfo('i-icon-bathroom', counted('i-icon-bathroom', item.no_of_bathrooms));
+  return info;
 }
 
 function domCards() {
@@ -625,9 +670,10 @@ function harvestSkin() {
 //   one becoming a count bubble rather than a pin. Verified exactly: 250
 //   buckets against 250 markers, the 30 multi-buckets against the 30
 //   `.multiple` markers, their sizes summing to the counts drawn. We group the
-//   same way, bubbles included — they look like a dead end, but the site's own
-//   are inert too (clicking one changes no zoom, no centre, no popup), so
-//   reproducing one costs nothing that the original had.
+//   same way, bubbles included. A bubble carries no link and clicking one does
+//   nothing on the site's map either — no zoom, no re-centre, no popup — but
+//   hovering it lists every listing at that point, which is where the listings
+//   a bubble stands for are reachable from. Ours does the same.
 //
 //   Panning is free, zooming isn't. Leaflet pans by translating the whole map
 //   pane, so every layer point stays valid and our pins ride along untouched;
@@ -649,6 +695,8 @@ const PIN_ATTR = 'data-sg-v02-pin'; // one of ours, one per cell, for as long as
 const PIN_ID_ATTR = 'data-sg-v02-id'; // the listing ids it stands for, space-separated
 const HOVER_ATTR = 'data-sg-v02-hover'; // the transient hover pin, for when we own no map
 const BORROWED_ATTR = 'data-sg-v02-focus'; // one of the site's, focused by us
+const POPUP_PANE = '.leaflet-popup-pane';
+const POPUP_ATTR = 'data-sg-v02-popup'; // the one popup of ours that can be open
 const MAP_SETTLE_MS = 80;
 // Styling the site reserves for boosted ads. Ours are never boosted.
 const BOOSTED_CLASSES = ['topVip', 'vip', 'price-dropped'];
@@ -665,9 +713,8 @@ const GEOHASH_PRECISION = 8; // what the map endpoint's own bucket keys use
 const OFFSET_METRES_NORTH = 100;
 const METRES_PER_DEGREE_LAT = 111320;
 
-let mapPins = []; // [{ el, items, lat, lng }] — one entry per cell, while the takeover is up
+let mapPins = []; // [{ el, items, lat, lng, shape }] — one entry per cell, while the takeover is up
 let mapPinsFor = null; // the result object they were built from
-let mapPinShape = null; // the marker class string last copied off the site
 let mapPaneObserver = null;
 let observedMapPane = null; // which map pane that observer is attached to
 let mapPlaceTimer = null;
@@ -804,31 +851,77 @@ function isBoosted(className) {
   return className.split(/\s+/).some((cls) => BOOSTED_CLASSES.includes(cls));
 }
 
-function markerPrototype(multiple = false) {
+function markerKind(items) {
+  return `${items.length > 1 ? 'multiple' : 'single'}|${
+    items[0].geocodeType === 'offset' ? 'offset' : 'exact'
+  }`;
+}
+
+function markerPrototypes() {
   // Clone rather than build: marker markup carries a build-specific Vue scope
   // attribute exactly like the cards do, and cloning inherits it for free.
-  // Which marker to clone is really the question "what would the site have
-  // drawn for an ordinary private listing?", so prefer the shape it drew most
-  // often among the unboosted ones, and settle for a boosted shape only if the
-  // whole map happens to be ads.
-  const selector = multiple ? '.marker.multiple' : '.marker:not(.multiple)';
-  const tally = new Map();
-  for (const marker of document.querySelectorAll(`${MARKER_PANE} ${selector}`)) {
+  // Which marker to clone is the question "what would the site have drawn for
+  // an ordinary private listing?" — and the answer depends on three things at
+  // once, so there's one per kind rather than one for the map.
+  //
+  // Whether it stands for one listing or several, and whether the listing is
+  // exactly geocoded, each change what's inside the marker and not just its
+  // classes: at `medium` an exact pin is a 22×28 SVG teardrop, an offset one is
+  // a bare dot with no SVG in it at all, and a group carries a count span where
+  // a single pin carries a link. The third is the size class the site swaps as
+  // you zoom, which is why this is re-read on every placement rather than once.
+  //
+  // Within a kind, prefer the shape the site drew most often among the
+  // unboosted markers, and settle for a boosted one only if the whole map
+  // happens to be ads.
+  const kinds = new Map(); // kind -> Map(class string -> [markers])
+  for (const marker of document.querySelectorAll(`${MARKER_PANE} .marker`)) {
     if (marker.closest(`[${PIN_ATTR}], [${HOVER_ATTR}]`)) continue; // never clone our own
+    const kind = `${marker.classList.contains('multiple') ? 'multiple' : 'single'}|${
+      marker.classList.contains('offset') ? 'offset' : 'exact'
+    }`;
     const shape = marker.className.replace(/\bfocused\b/g, '').replace(/\s+/g, ' ').trim();
-    if (!tally.has(shape)) tally.set(shape, []);
-    tally.get(shape).push(marker);
+    if (!kinds.has(kind)) kinds.set(kind, new Map());
+    const shapes = kinds.get(kind);
+    if (!shapes.has(shape)) shapes.set(shape, []);
+    shapes.get(shape).push(marker);
   }
 
-  let best = null;
-  for (const [shape, group] of tally) {
-    const better =
-      !best ||
-      (isBoosted(best.shape) && !isBoosted(shape)) ||
-      (isBoosted(best.shape) === isBoosted(shape) && group.length > best.group.length);
-    if (better) best = { shape, group };
+  const best = new Map();
+  for (const [kind, shapes] of kinds) {
+    let winner = null;
+    for (const [shape, group] of shapes) {
+      const better =
+        !winner ||
+        (isBoosted(winner.shape) && !isBoosted(shape)) ||
+        (isBoosted(winner.shape) === isBoosted(shape) && group.length > winner.group.length);
+      if (better) winner = { shape, group };
+    }
+    const el = winner?.group[0].closest('.leaflet-marker-icon');
+    if (el) best.set(kind, { el, shape: winner.shape });
   }
-  return best ? best.group[0].closest('.leaflet-marker-icon') : null;
+  return best;
+}
+
+function prototypeFor(kind, prototypes) {
+  const [group, geocode] = kind.split('|');
+  const otherGroup = group === 'single' ? 'multiple' : 'single';
+  const otherGeocode = geocode === 'exact' ? 'offset' : 'exact';
+  // Relax the geocode type before the multiplicity. A bubble cloned from a
+  // single pin has no count in it, which is the whole of what a bubble says;
+  // a pin cloned from the other geocode type differs only in how the site
+  // draws a location it isn't sure of. Both are last resorts — they need the
+  // map to be showing no marker of the right kind at all.
+  for (const candidate of [
+    `${group}|${geocode}`,
+    `${group}|${otherGeocode}`,
+    `${otherGroup}|${geocode}`,
+    `${otherGroup}|${otherGeocode}`,
+  ]) {
+    const found = prototypes.get(candidate);
+    if (found) return found;
+  }
+  return null;
 }
 
 function normalisePinClasses(marker, item) {
@@ -840,26 +933,33 @@ function normalisePinClasses(marker, item) {
 }
 
 function syncPinShapes() {
-  // The site swaps a marker's size class as you zoom — `compact` low down,
-  // `medium` further in — so a pin built at one zoom is the wrong size at the
-  // next. Rather than keep our own list of which class names are sizes, copy
-  // the whole class string off a live marker and reapply the two parts that
-  // are ours to decide.
-  const shape = markerPrototype()?.querySelector('.marker')?.className;
-  if (!shape || shape === mapPinShape) return;
-  mapPinShape = shape;
-  const clusterShape = markerPrototype(true)?.querySelector('.marker')?.className;
+  // The site redraws its markers as you zoom — `compact` low down, `medium`
+  // further in — so a pin cloned at one zoom is the wrong pin at the next.
+  //
+  // Rebuilt from the marker the site is drawing now, rather than relabelled.
+  // Moving the class string across was the first thing tried and it is not
+  // enough: `.marker.medium` is written for a marker with a 22×28 SVG inside
+  // it, a compact clone has no SVG to give it, and the result computes to a
+  // 12×0 box with no background — every pin on the map silently disappearing
+  // one zoom level in.
+  const prototypes = markerPrototypes();
+  if (!prototypes.size) return;
 
-  for (const { el, items } of mapPins) {
-    const marker = el.querySelector('.marker');
-    // A cluster with no bubble on the map to copy keeps whatever it was built
-    // as; re-shaping it from the single-pin string would strip the `multiple`
-    // that makes its count render.
-    if (!marker || (items.length > 1 && !clusterShape)) continue;
-    const focused = marker.classList.contains('focused');
-    marker.className = items.length > 1 ? clusterShape : shape;
-    normalisePinClasses(marker, items[0]);
-    if (focused) marker.classList.add('focused');
+  for (const entry of mapPins) {
+    const found = prototypeFor(markerKind(entry.items), prototypes);
+    if (!found || found.shape === entry.shape) continue;
+    const pin = buildPin(entry.items, found.el);
+    // The pin is being replaced mid-flight, so it keeps where it was put and
+    // whether a card is currently hovering it.
+    pin.style.transform = entry.el.style.transform;
+    pin.style.zIndex = entry.el.style.zIndex;
+    if (entry.el.querySelector('.marker.focused')) {
+      pin.querySelector('.marker')?.classList.add('focused');
+    }
+    entry.el.replaceWith(pin);
+    entry.el = pin;
+    entry.shape = found.shape;
+    bindPinPopup(entry);
   }
 }
 
@@ -923,6 +1023,7 @@ function placeMapPins() {
     // one behind it consistently rather than at random. Same rule for ours.
     el.style.zIndex = String(Math.round(point.y));
   }
+  placePopup();
   return true;
 }
 
@@ -969,10 +1070,10 @@ function watchMapPane() {
 }
 
 function removeMapPins() {
+  closePinPopup();
   for (const { el } of mapPins) el.remove();
   mapPins = [];
   mapPinsFor = null;
-  mapPinShape = null; // freshly cloned pins get their shape checked again
   // Belt and braces: a pin orphaned by a re-render is still ours to clear up.
   document.querySelectorAll(`[${PIN_ATTR}]`).forEach((pin) => pin.remove());
 }
@@ -981,16 +1082,12 @@ function renderMapPins() {
   const pane = document.querySelector(MARKER_PANE);
   if (!pane || !currentResult) return false;
 
-  const prototype = markerPrototype();
-  // No prototype means the site drew no pins of its own — a map that hasn't
+  // No prototypes means the site drew no pins of its own — a map that hasn't
   // loaded, or a search with nothing in it. Either way there's nothing to clone
   // and nothing to improve on, and hiding a map we can't redraw is strictly
   // worse than leaving it alone.
-  if (!prototype) return false;
-  // Bubbles are rarer, so a map can easily have none to clone. Falling back to
-  // the single-pin shape means a busy cell draws as one dot standing for
-  // several listings — the count is what's lost, not the location.
-  const clusterPrototype = markerPrototype(true) || prototype;
+  const prototypes = markerPrototypes();
+  if (!prototypes.size) return false;
 
   const pinned = currentResult.listings.filter(
     (item) => typeof item.latitude === 'number' && typeof item.longitude === 'number'
@@ -1008,9 +1105,13 @@ function renderMapPins() {
   removeMapPins();
   const batch = document.createDocumentFragment();
   mapPins = Array.from(cells.values(), ({ items, lat, lng }) => {
-    const el = buildPin(items, items.length > 1 ? clusterPrototype : prototype);
-    batch.appendChild(el);
-    return { el, items, lat, lng };
+    // Always answers: there are four kinds, prototypeFor tries all four, and
+    // the map has at least one marker on it or we'd have given up above.
+    const { el: prototype, shape } = prototypeFor(markerKind(items), prototypes);
+    const entry = { el: buildPin(items, prototype), items, lat, lng, shape };
+    bindPinPopup(entry);
+    batch.appendChild(entry.el);
+    return entry;
   });
   if (!placeMapPins()) {
     // No projection yet, so we don't know where any of them go. Drop them and
@@ -1024,6 +1125,7 @@ function renderMapPins() {
   document.documentElement.setAttribute(MAP_TAKEOVER_ATTR, '');
   syncMapCaption();
   watchMapPane();
+  harvestPopupSkin();
   return true;
 }
 
@@ -1045,6 +1147,9 @@ function ensureMapPins() {
 
 function teardownMapPins() {
   removeMapPins();
+  // A harvest that came back with nothing gets another go on the next takeover
+  // — the map may simply not have finished drawing its own markers yet.
+  if (!popupSkin) popupHarvests = 0;
   if (originalMapCaption !== null) {
     setMapCaption(null);
     originalMapCaption = null;
@@ -1109,7 +1214,7 @@ function focusOnMap(item, href) {
   }
 
   const project = mapProjection();
-  const prototype = markerPrototype();
+  const prototype = prototypeFor(markerKind([item]), markerPrototypes())?.el;
   if (!project || !prototype || typeof item.latitude !== 'number') return;
 
   const where = markerPoint(item);
@@ -1131,6 +1236,342 @@ function focusOnMap(item, href) {
     Math.max(0, ...Array.from(pane.children, (child) => Number(child.style.zIndex) || 0)) + 1
   );
   pane.appendChild(pin);
+}
+
+// ---- the popup a pin opens when you hover it ----
+//
+// Hovering one of the site's markers opens a small card over the map: photo,
+// title, area, the same three icons a results card carries, price, and a link
+// through to the listing. Our pins are clones of its markers but not its
+// Leaflet layers, so nothing was ever bound to them and hovering one did
+// nothing at all — the map went quiet exactly where the column had got louder.
+//
+// The popup is a component of its own, with a Vue scope attribute neither the
+// marker nor the results card shares, and it exists in the page only while one
+// of the site's own markers is hovered. So we ask for one: the site's markers
+// are hidden while we hold the map, but they are still there and still bound,
+// and a synthetic mouseover runs their listeners whether or not the node has a
+// box to hover. Read the attribute names off what comes back, drop it, and
+// from then on the site's stylesheet draws a popup we build ourselves — the
+// same bargain the cards are built on.
+
+// The site opens its popup 18px clear of the marker's point, below it where
+// there's room and above it where there isn't. Measured off its own.
+const POPUP_GAP = 18;
+const POPUP_CLOSE_MS = 120; // grace period for crossing that gap onto the popup
+const POPUP_HARVEST_MS = 300; // long enough for Vue to render the one we asked for
+const POPUP_HARVEST_TRIES = 3;
+
+let popupSkin = null; // { scope, cardScope, iconClass, iconSize, sprite } off one of the site's
+let popupHarvests = 0;
+let openPopup = null; // { el, entry } while one of ours is up
+let popupCloseTimer = null;
+
+function scopeAttrs(el) {
+  return el ? Array.from(el.attributes, (attr) => attr.name).filter((n) => n.startsWith('data-v-')) : [];
+}
+
+function learnPointHeader(marker, popup) {
+  // "5 ακίνητα βρέθηκαν σε αυτό το σημείο" — the line the site writes over a
+  // group of listings shot from one point. Read off the page and kept per
+  // locale, the same way every other piece of its wording is.
+  if (labels.pointHeader) return;
+  const count = marker.querySelector('.marker__count')?.textContent.trim();
+  const header = popup.querySelector('.mapPopup__header')?.textContent.replace(/\s+/g, ' ').trim();
+  if (!count || !header || !new RegExp(`\\b${count}\\b`).test(header)) return;
+  labels.pointHeader = header.replace(new RegExp(`\\b${count}\\b`), '%d');
+  labelsDirty = true;
+  saveLabels();
+}
+
+function harvestPopupSkin() {
+  if (popupSkin || popupHarvests >= POPUP_HARVEST_TRIES) return;
+  const markers = Array.from(
+    document.querySelectorAll(`${MARKER_PANE} .leaflet-marker-icon:not([${PIN_ATTR}]):not([${HOVER_ATTR}])`)
+  );
+  // A bubble's popup is worth more than a pin's. It carries the header the site
+  // writes over a group, which is wording we would otherwise have to invent,
+  // and the cards inside are the same component either way.
+  const marker = markers.find((node) => node.querySelector('.marker.multiple')) || markers[0];
+  if (!marker) return;
+  popupHarvests += 1;
+
+  const before = new Set(document.querySelectorAll(`${POPUP_PANE} .leaflet-popup`));
+  for (const type of ['pointerover', 'mouseover', 'mouseenter']) {
+    marker.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+  }
+
+  setTimeout(() => {
+    for (const type of ['pointerout', 'mouseout', 'mouseleave']) {
+      marker.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+    }
+    const popup = Array.from(document.querySelectorAll(`${POPUP_PANE} .leaflet-popup`)).find(
+      (node) => !before.has(node)
+    );
+    const box = popup?.querySelector('.mapPopup');
+    const card = popup?.querySelector('.card');
+    const scope = scopeAttrs(box)[0] || null;
+    // The card inside carries the popup's scope attribute as well as its own,
+    // and its own is the one that isn't the popup's.
+    const cardScope = card ? scopeAttrs(card).find((name) => name !== scope) : null;
+    // Both or neither: these two attributes are the whole reason for asking, and
+    // a popup built without them is an unstyled block of text over the map.
+    // Better to leave the pins as pins than to draw that.
+    if (scope && cardScope) {
+      const icon = card.querySelector('.card__info svg');
+      popupSkin = {
+        scope,
+        cardScope,
+        iconClass: icon?.getAttribute('class') || 'icon sprite-icons',
+        // Smaller here than on a results card, so read rather than shared.
+        iconSize: icon?.getAttribute('width') || '15',
+        // One sprite file per build, so a card's will do when the listing this
+        // popup happens to stand for has nothing to put icons beside.
+        sprite:
+          (icon?.querySelector('use')?.getAttribute('href') || '').split('#')[0] ||
+          harvestSkin().sprite,
+      };
+      learnPointHeader(marker, popup);
+    }
+    // Ours to clear up: nobody asked for this popup but us, and leaving it
+    // behind would put an agency's listing back over the map the moment the
+    // toggle goes off and the rule that hides it stops applying.
+    popup?.remove();
+  }, POPUP_HARVEST_MS);
+}
+
+function buildPopupCard(item, horizontal) {
+  const S = popupSkin.cardScope;
+  const el = (tag, cls) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (S) node.setAttribute(S, '');
+    return node;
+  };
+  const href = aggeliaHref(item);
+  const title = listingTitle(item);
+
+  const article = el('article', `card has--shadow is--link${horizontal ? ' card--horizontal' : ''}`);
+  // The site's own popup card carries the popup's scope attribute as well as
+  // the card's — Vue marks a child component's root element with its parent's
+  // id too, and that's the hook a parent uses to style what it embeds.
+  if (popupSkin.scope) article.setAttribute(popupSkin.scope, '');
+
+  const texts = el('div', 'card__texts');
+  const header = el('header', 'card__title');
+  const line = el('div', 'title--ellipsis');
+  const subtype = el('span', 'ellipsis');
+  subtype.textContent = labels.subs[`${item.category}|${item.subtype}`] || '';
+  const size = el('span', '');
+  size.textContent = item.sq_meters ? `${item.sq_meters}τ.μ.` : '';
+  line.append(subtype, size);
+  header.appendChild(line);
+  texts.appendChild(header);
+
+  const where = el('div', 'card__description ellipsis');
+  where.textContent = item.geography || '';
+  texts.appendChild(where);
+
+  const extras = el('div', 'card__extras');
+  extras.appendChild(
+    buildInfoList(item, {
+      listClass: 'card__info',
+      scope: S,
+      sprite: popupSkin.sprite,
+      iconClass: popupSkin.iconClass,
+      iconSize: popupSkin.iconSize,
+    })
+  );
+  texts.appendChild(extras);
+
+  const footer = el('footer', 'card__footer');
+  const price = el('div', 'card__price');
+  const main = el('p', 'price__main');
+  if (typeof item.price === 'number') {
+    main.textContent = `€ ${formatPrice(item.price)}`;
+    if (item.buy_or_rent === '1' && labels.perMonth) {
+      const per = el('small', '');
+      per.textContent = ` ${labels.perMonth}`;
+      main.appendChild(per);
+    }
+  }
+  price.appendChild(main);
+  footer.appendChild(price);
+  texts.appendChild(footer);
+  article.appendChild(texts);
+
+  if (item.mainImageURL) {
+    const img = el('img', '');
+    img.src = item.mainImageURL;
+    img.loading = 'lazy';
+    img.alt = title;
+    if (horizontal) {
+      const figure = el('figure', 'card__figure');
+      figure.appendChild(img);
+      article.appendChild(figure);
+    } else {
+      // The site's own is a carousel with the listing's whole gallery in it.
+      // One slide is all a single photo needs, and the geometry is on the
+      // classes rather than in the component's script — the inner two elements
+      // are the carousel library's and carry no scope attribute, so neither do
+      // ours.
+      const slider = el('section', 'hooper');
+      const list = document.createElement('div');
+      list.className = 'hooper-list';
+      const track = document.createElement('ul');
+      track.className = 'hooper-track';
+      const slide = el('li', 'slider__item hooper-slide is-active is-current');
+      slide.appendChild(img);
+      track.appendChild(slide);
+      list.appendChild(track);
+      slider.appendChild(list);
+      article.appendChild(slider);
+    }
+  }
+
+  // The site's own popup is a link that opens in a new tab, which is the one
+  // thing a popup has to do that hovering a pin can't.
+  const link = el('a', 'card__link');
+  if (href) {
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener';
+  }
+  link.title = title;
+  link.setAttribute('aria-label', title);
+  article.appendChild(link);
+
+  return article;
+}
+
+function buildPopup(entry) {
+  const { items } = entry;
+  const group = items.length > 1;
+  const S = popupSkin.scope;
+  const el = (tag, cls) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (S) node.setAttribute(S, '');
+    return node;
+  };
+
+  const popup = document.createElement('div');
+  popup.setAttribute(POPUP_ATTR, '');
+  // The site keys some of the popup's own geometry on the marker's size and
+  // geocode classes, so the popup wears whatever the pin under it is wearing.
+  const marker = entry.el.querySelector('.marker');
+  const oursToSay = ['marker', 'multiple', 'focused', ...BOOSTED_CLASSES];
+  const worn = (marker?.className || '').split(/\s+/).filter((cls) => cls && !oursToSay.includes(cls));
+  popup.className = [
+    'leaflet-popup',
+    group ? 'multi' : 'single',
+    ...worn,
+    'leaflet-zoom-animated',
+    'leaflet-rrose-custom',
+  ].join(' ');
+
+  // Leaflet's own two wrappers, which its stylesheet strips to nothing for a
+  // custom popup — no scope attribute on either, they aren't Vue's.
+  const wrapper = document.createElement('div');
+  wrapper.className = 'leaflet-popup-content-wrapper';
+  const content = document.createElement('div');
+  content.className = 'leaflet-popup-content';
+
+  const box = el('div', `mapPopup${group ? ' mapPopup--multiple' : ''}`);
+  const inner = el('div', 'mapPopup__inner');
+  if (group) {
+    if (labels.pointHeader) {
+      const header = el('div', 'mapPopup__header');
+      header.textContent = labels.pointHeader.replace('%d', String(items.length));
+      inner.appendChild(header);
+    }
+    const main = el('div', 'mapPopup__main');
+    for (const item of items) main.appendChild(buildPopupCard(item, true));
+    inner.appendChild(main);
+  } else {
+    inner.appendChild(buildPopupCard(items[0], false));
+  }
+
+  box.appendChild(inner);
+  content.appendChild(box);
+  wrapper.appendChild(content);
+  popup.appendChild(wrapper);
+  return popup;
+}
+
+function placePopup() {
+  if (!openPopup) return;
+  const { el, entry } = openPopup;
+  const project = mapProjection();
+  // Null mid-zoom, when every coordinate on the map is briefly a lie. The pass
+  // that ends the zoom brings us back here.
+  if (!project) return;
+
+  const point = project(entry.lat, entry.lng);
+  const height = el.offsetHeight;
+  const container = document.querySelector('.leaflet-container');
+  const room = container
+    ? container.getBoundingClientRect().bottom - entry.el.getBoundingClientRect().bottom
+    : Infinity;
+  // The popup pane is laid out from the map's own origin, so a layer point
+  // reaches it the same way it reaches a marker: translate to the point, then
+  // offset by half the popup's width to centre it and by the gap to clear the
+  // pin. Below it by default, above it when the map's bottom edge is nearer
+  // than the popup is tall.
+  el.style.transform = `translate3d(${point.x}px, ${point.y}px, 0px)`;
+  el.style.left = `${-Math.round(el.offsetWidth / 2)}px`;
+  el.style.top = `${room > height + POPUP_GAP ? POPUP_GAP : -(height + POPUP_GAP)}px`;
+}
+
+function closePinPopup() {
+  if (popupCloseTimer) {
+    clearTimeout(popupCloseTimer);
+    popupCloseTimer = null;
+  }
+  openPopup?.el.remove();
+  openPopup = null;
+}
+
+function schedulePopupClose() {
+  if (popupCloseTimer) clearTimeout(popupCloseTimer);
+  popupCloseTimer = setTimeout(() => {
+    popupCloseTimer = null;
+    closePinPopup();
+  }, POPUP_CLOSE_MS);
+}
+
+function openPinPopup(entry) {
+  if (popupCloseTimer) {
+    clearTimeout(popupCloseTimer);
+    popupCloseTimer = null;
+  }
+  if (openPopup?.entry === entry) return; // already up, the pointer just re-entered
+  closePinPopup();
+  // Before the skin has been read there's nothing to draw a popup with. It
+  // arrives a frame or two after the pins do, well before anyone has crossed
+  // the page to hover one.
+  if (!popupSkin) return;
+  const pane = document.querySelector(POPUP_PANE);
+  if (!pane) return;
+
+  const el = buildPopup(entry);
+  // The popup has to be hoverable in its own right, or the listing it shows
+  // couldn't be clicked: crossing the gap between pin and popup would close it.
+  el.addEventListener('mouseenter', () => {
+    if (popupCloseTimer) {
+      clearTimeout(popupCloseTimer);
+      popupCloseTimer = null;
+    }
+  });
+  el.addEventListener('mouseleave', schedulePopupClose);
+  pane.appendChild(el);
+  openPopup = { el, entry };
+  placePopup();
+}
+
+function bindPinPopup(entry) {
+  entry.el.addEventListener('mouseenter', () => openPinPopup(entry));
+  entry.el.addEventListener('mouseleave', schedulePopupClose);
 }
 
 // ---- rendering the takeover ----
@@ -1226,35 +1667,15 @@ function buildCard(item, skin) {
   }
 
   const extras = el('div', 'tile__extras');
-  const info = el('ul', 'tile__info');
-  const addInfo = (iconName, entry) => {
-    if (!entry?.lead) return;
-    const li = el('li', '');
-    if (skin.sprite) {
-      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.setAttribute('class', skin.iconClass);
-      svg.setAttribute('width', skin.iconSize);
-      svg.setAttribute('height', skin.iconSize);
-      if (T) svg.setAttribute(T, '');
-      const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
-      use.setAttribute('href', `${skin.sprite}#${iconName}`);
-      svg.appendChild(use);
-      li.appendChild(svg);
-    }
-    const outer = el('span', '');
-    const inner = el('span', '');
-    inner.textContent = entry.lead;
-    outer.appendChild(inner);
-    if (entry.tail) outer.appendChild(document.createTextNode(` ${entry.tail} `));
-    li.appendChild(outer);
-    info.appendChild(li);
-  };
-  const counted = (iconName, count) =>
-    count ? { lead: String(count), tail: labels.units[iconName] || '' } : null;
-  addInfo('i-icon-floor', labels.floors[String(item.floorNumber)]);
-  addInfo('i-icon-bedroom', counted('i-icon-bedroom', item.rooms));
-  addInfo('i-icon-bathroom', counted('i-icon-bathroom', item.no_of_bathrooms));
-  extras.appendChild(info);
+  extras.appendChild(
+    buildInfoList(item, {
+      listClass: 'tile__info',
+      scope: T,
+      sprite: skin.sprite,
+      iconClass: skin.iconClass,
+      iconSize: skin.iconSize,
+    })
+  );
 
   const updated = el('p', 'tile__updated');
   const stamp = new Date((item.modified || '').replace(' ', 'T'));

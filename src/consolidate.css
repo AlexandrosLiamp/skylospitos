@@ -44,6 +44,20 @@ html[data-sg-v02-map] .leaflet-marker-pane .leaflet-marker-icon:not([data-sg-v02
   display: none !important;
 }
 
+/* Same for the popups. Every popup the site opens belongs to a marker we've
+   hidden, so it would float an agency's listing over a map that has none —
+   including the one we ask it for ourselves to read the popup's markup off
+   (harvestPopupSkin). Ours is the only one that should ever be up. */
+html[data-sg-v02-map] .leaflet-popup-pane .leaflet-popup:not([data-sg-v02-popup]) {
+  display: none !important;
+}
+
+/* Leaflet's popup pane doesn't take pointer events in every version, and a
+   popup you can't move onto is a listing you can't click through to. */
+.leaflet-popup-pane [data-sg-v02-popup] {
+  pointer-events: auto;
+}
+
 /* The site raises a hovered pin above its neighbours by reordering its own
    Leaflet layers, which ours aren't part of. Cheaper to say it here than to
    bookkeep two z-indexes per pin in JS — and !important is what beats the

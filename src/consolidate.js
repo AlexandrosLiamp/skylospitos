@@ -92,7 +92,15 @@ const MAP_PAGE_SIZE = 300; // the map endpoint's own cap, same story
 const LIST_REQUEST_BUDGET = 40;
 const CHUNK_SIZE = 6;
 const CHUNK_DELAY_MS = 200;
-const BACKOFF_BASE_DELAY_MS = 200; // starting delay for the one-shot 429/405 backoff, not inter-request pacing
+// Throttle handling. The delay is the pause after being throttled, not pacing
+// between requests, and it triples each time: 600ms, 1.8s, 5s, 5s. The budget
+// is shared by the whole run rather than granted per request, so a search that
+// is being throttled steadily gives up rather than hammering away — but four
+// goes is enough to ride out the burst-throttle the site answers with when a
+// wide search asks for thirty-odd pages of it.
+const BACKOFF_BASE_DELAY_MS = 200;
+const BACKOFF_MAX_DELAY_MS = 5000;
+const BACKOFF_MAX_TRIES = 4;
 
 const RESULTS_PER_PAGE = 30; // matches the site's own pagination.perPage
 
@@ -196,26 +204,36 @@ async function fetchPageByOffset(baseUrl, offset, signal) {
   return parseSearchResponse(await res.json());
 }
 
+// 405 shows up alongside 429 when the live site throttles (confirmed
+// empirically — a lone retry of a 405'd offset succeeds instantly, so it's a
+// soft burst-throttle, not a real client error). Treat it the same as 429.
+function isThrottle(status) {
+  return status === 429 || status === 405;
+}
+
+async function backoffPause(backoffState, signal, why) {
+  backoffState.tries += 1;
+  backoffState.delayMs = Math.min(backoffState.delayMs * 3, BACKOFF_MAX_DELAY_MS);
+  console.warn(
+    `[SG-V02] ${why} — backing off to ${backoffState.delayMs}ms (try ${backoffState.tries}/${BACKOFF_MAX_TRIES})`
+  );
+  await new Promise((r) => setTimeout(r, backoffState.delayMs));
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+}
+
 async function fetchWithBackoff(apiUrl, offset, signal, backoffState) {
-  // One retry on 429/405 per session, with a growing delay. Anything else
-  // bubbles up to renderConsolidationError so the user can decide. 405 shows
-  // up alongside 429 when the server is throttling (see fetchChunkWithBackoff)
-  // — the opening request needs the same protection, since a throttled first
-  // request would otherwise fail the whole run instantly with no retry at all.
-  try {
-    return await fetchPageByOffset(apiUrl, offset, signal);
-  } catch (err) {
-    if ((err.status === 429 || err.status === 405) && backoffState.tries < 1) {
-      backoffState.tries++;
-      backoffState.delayMs = Math.min(backoffState.delayMs * 4, 2000);
-      console.warn(
-        `[SG-V02] ${err.status} at offset ${offset} — backing off to ${backoffState.delayMs}ms`
-      );
-      await new Promise((r) => setTimeout(r, backoffState.delayMs));
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  // Throttling gets a growing pause and another go; anything else bubbles up to
+  // renderConsolidationError so the user can decide. The opening request needs
+  // this as much as any of them — arriving mid-throttle, it used to fail the
+  // entire run before a single listing had been read, which is what a drawn
+  // search of ten thousand listings kept doing.
+  for (;;) {
+    try {
       return await fetchPageByOffset(apiUrl, offset, signal);
+    } catch (err) {
+      if (!isThrottle(err.status) || backoffState.tries >= BACKOFF_MAX_TRIES) throw err;
+      await backoffPause(backoffState, signal, `${err.status} at offset ${offset}`);
     }
-    throw err;
   }
 }
 
@@ -238,40 +256,38 @@ async function fetchChunkWithBackoff(apiUrl, offsets, signal, backoffState) {
   // the earliest failing page, matching how the old serial loop always died.
   const lowest = (list) => list.reduce((a, b) => (a.offset <= b.offset ? a : b));
 
-  // 405 shows up alongside 429 when the live site throttles (confirmed
-  // empirically — a lone retry of a 405'd offset succeeds instantly, so it's a
-  // soft burst-throttle, not a real client error). Treat it the same as 429.
-  const isThrottle = (status) => status === 429 || status === 405;
   const realErrors = failures.filter((f) => !isThrottle(f.err?.status));
   if (realErrors.length > 0) throw lowest(realErrors).err;
 
-  // Every failure is a throttle: one retry episode for the whole session, not per request.
-  if (backoffState.tries >= 1) throw lowest(failures).err;
-  backoffState.tries++;
-  backoffState.delayMs = Math.min(backoffState.delayMs * 4, 2000);
-  console.warn(
-    `[SG-V02] ${failures.length} × 429/405 in chunk — backing off to ${backoffState.delayMs}ms and retrying`
-  );
-  await new Promise((r) => setTimeout(r, backoffState.delayMs));
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  // Every failure is a throttle, so keep asking for the ones that didn't land,
+  // on the budget the whole run shares. Each pass narrows the set: a chunk of
+  // six that comes back with four throttled and then one is three pages nearer
+  // done, and only what is still failing when the budget runs out is fatal.
+  let pending = failures;
+  const recovered = new Map();
+  while (pending.length > 0) {
+    if (backoffState.tries >= BACKOFF_MAX_TRIES) throw lowest(pending).err;
+    await backoffPause(backoffState, signal, `${pending.length} × 429/405 in chunk`);
 
-  const retryOffsets = failures.map((f) => f.offset);
-  const retried = await Promise.allSettled(
-    retryOffsets.map((offset) => fetchPageByOffset(apiUrl, offset, signal))
-  );
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const retryOffsets = pending.map((f) => f.offset);
+    const retried = await Promise.allSettled(
+      retryOffsets.map((offset) => fetchPageByOffset(apiUrl, offset, signal))
+    );
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-  const retryFailures = [];
-  const retryValueByOffset = new Map();
-  retried.forEach((r, i) => {
-    if (r.status === 'rejected') retryFailures.push({ offset: retryOffsets[i], err: r.reason });
-    else retryValueByOffset.set(retryOffsets[i], r.value);
-  });
-  if (retryFailures.length > 0) throw lowest(retryFailures).err;
+    const stillFailing = [];
+    retried.forEach((r, i) => {
+      if (r.status === 'rejected') stillFailing.push({ offset: retryOffsets[i], err: r.reason });
+      else recovered.set(retryOffsets[i], r.value);
+    });
+    // A retry that comes back with something other than a throttle is a real
+    // failure and stops the run, exactly as it would have on the first attempt.
+    const realRetryErrors = stillFailing.filter((f) => !isThrottle(f.err?.status));
+    if (realRetryErrors.length > 0) throw lowest(realRetryErrors).err;
+    pending = stillFailing;
+  }
 
-  return settled.map((r, i) =>
-    r.status === 'fulfilled' ? r.value : retryValueByOffset.get(offsets[i])
-  );
+  return settled.map((r, i) => (r.status === 'fulfilled' ? r.value : recovered.get(offsets[i])));
 }
 
 async function planFetch(signal, backoffState) {

@@ -2190,5 +2190,18 @@ chrome.storage.sync.get({ filterEnabled: true, consolidateEnabled: null }, async
   if (state.consolidateEnabled !== null) chrome.storage.sync.remove('consolidateEnabled');
   await loadLabels();
   await new Promise((r) => setTimeout(r, 1500));
-  if (state.filterEnabled) await runConsolidation();
+  // The live toggle, not the value this callback read a second and a half ago.
+  // Turning the filter off inside that window leaves the off-switch nothing to
+  // undo — activeController is still null and no takeover is up yet, so both
+  // its abort and its teardown are no-ops — and the captured value would then
+  // start one anyway, against a toggle that reads off. Nothing takes it down
+  // afterwards either: reassertTakeover's first guard is !filterEnabled, so it
+  // declines to touch a takeover it should be removing, and the column stays
+  // ours until the user toggles on and off again by hand.
+  //
+  // The second half of that window is the mirror image: turning the filter on
+  // has the storage listener start a consolidation of its own, and running
+  // again here would abort it and refetch from the beginning, resetting the
+  // progress the user is watching.
+  if (filterEnabled && !v02Loading && !currentResult) await runConsolidation();
 });

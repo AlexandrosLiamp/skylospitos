@@ -58,6 +58,16 @@ html[data-sg-v02-map] .leaflet-popup-pane .leaflet-popup:not([data-sg-v02-popup]
   pointer-events: auto;
 }
 
+/* Zoomed in past the dots, the site draws each marker as a near-white pill
+   (#f9fafd) with a 2px white border — which reads well over its own muted map
+   and disappears over anything busier. Ours take the site's accent orange on
+   that border instead: same pill, same size, same price inside it, but findable
+   at a glance. Only the expanded ones; further out a marker is an orange dot
+   already and a border of the same colour would just erase its outline. */
+.leaflet-marker-pane [data-sg-v02-pin] .marker.expanded {
+  border-color: #FE900A;
+}
+
 /* The site raises a hovered pin above its neighbours by reordering its own
    Leaflet layers, which ours aren't part of. Cheaper to say it here than to
    bookkeep two z-indexes per pin in JS — and !important is what beats the

@@ -715,6 +715,7 @@ const METRES_PER_DEGREE_LAT = 111320;
 
 let mapPins = []; // [{ el, items, lat, lng, shape }] — one entry per cell, while the takeover is up
 let mapPinsFor = null; // the result object they were built from
+let lastShapeScale = null; // the zoom, as pixels-per-half-world, that the shapes were last built for
 let mapPaneObserver = null;
 let observedMapPane = null; // which map pane that observer is attached to
 let mapPlaceTimer = null;
@@ -942,8 +943,10 @@ function syncPinShapes() {
   // it, a compact clone has no SVG to give it, and the result computes to a
   // 12×0 box with no background — every pin on the map silently disappearing
   // one zoom level in.
+  // Nothing to read a shape off yet — the caller keeps looking rather than
+  // recording this zoom as one whose shapes have been settled.
   const prototypes = markerPrototypes();
-  if (!prototypes.size) return;
+  if (!prototypes.size) return false;
 
   for (const entry of mapPins) {
     const found = prototypeFor(markerKind(entry.items), prototypes);
@@ -961,6 +964,7 @@ function syncPinShapes() {
     entry.shape = found.shape;
     bindPinPopup(entry);
   }
+  return true;
 }
 
 function buildPin(items, prototype) {
@@ -979,12 +983,35 @@ function buildPin(items, prototype) {
 
   const marker = pin.querySelector('.marker');
   if (marker) normalisePinClasses(marker, item);
-  // Only the boosted markers carry a price bubble, and ours aren't boosted, so
-  // if the clone brought one along it goes with the classes that justified it.
-  pin.querySelector('.marker__price')?.remove();
+  // Zoomed in far enough the site writes the price inside the marker instead of
+  // drawing a bare dot, and a pin that drops it is the blank white box it was
+  // reported as. Keep the element the clone came with and put this listing's
+  // price in it, in whatever arrangement the site was already using — which
+  // side the symbol sits on, which separators, any suffix — by swapping the
+  // number and leaving the rest of the text alone. A group can't answer with
+  // one price, so it keeps its count and loses the bubble.
+  const price = pin.querySelector('.marker__price');
+  if (price) {
+    if (items.length === 1 && typeof item.price === 'number') {
+      const formatted = formatPrice(item.price);
+      price.textContent = /\d/.test(price.textContent)
+        ? price.textContent.replace(/\d+(?:[.,\s]\d+)*/, formatted)
+        : `${formatted} €`;
+    } else {
+      price.remove();
+    }
+  }
 
+  // Same swap-the-number-keep-the-wording as the price above, and for the same
+  // reason: zoomed out a bubble says "5", zoomed in it says "5 ακίνητα", and
+  // writing the bare count over that leaves a pill sized for two words with one
+  // digit rattling around in it — 31px where the site's is 82px.
   const count = pin.querySelector('.marker__count');
-  if (count) count.textContent = String(items.length);
+  if (count) {
+    count.textContent = /\d/.test(count.textContent)
+      ? count.textContent.replace(/\d+/, String(items.length))
+      : String(items.length);
+  }
 
   const link = pin.querySelector('.marker__link');
   if (link) {
@@ -1009,12 +1036,20 @@ function buildPin(items, prototype) {
 
 function placeMapPins() {
   if (!mapPins.length) return false;
-  syncPinShapes();
   const project = mapProjection();
   // Null through a zoom animation, when every coordinate on the map is
   // momentarily a lie, and before the first tile loads. Both resolve on their
   // own, and the style changes that end them bring us back here.
   if (!project) return false;
+
+  // Half the world in pixels: the same for every origin, different for every
+  // zoom. A marker's shape is a function of the zoom and nothing else, so this
+  // is what says whether the shapes need looking at — and it costs two
+  // multiplications against a rescan of every marker on the map, which on a
+  // wide search is several hundred of them, on every pan and every tile that
+  // lands.
+  const scale = project(0, 180).x - project(0, 0).x;
+  if (scale !== lastShapeScale && syncPinShapes()) lastShapeScale = scale;
 
   for (const { el, lat, lng } of mapPins) {
     const point = project(lat, lng);
@@ -1050,7 +1085,21 @@ function watchMapPane() {
   // lands brings us back for another look, and the passes stop when the map
   // does. Neither target contains our pins, so our own writes below don't
   // retrigger this.
-  mapPaneObserver = new MutationObserver(() => {
+  mapPaneObserver = new MutationObserver((mutations) => {
+    // A style change on the map pane itself is Leaflet ending a pan or a zoom:
+    // it resets the pane's transform and puts its own markers where they now
+    // belong. Ours belong there in the same frame. Waiting out the debounce
+    // first leaves them for 80ms at coordinates that describe the zoom level
+    // you just left, which is the lurch after every zoom. Tile mutations stay
+    // debounced — they arrive in bursts and say nothing about where anything
+    // goes; this only skips ahead when a placement actually succeeds.
+    if (mutations.some((m) => m.target === mapPane) && mapPins.length && placeMapPins()) {
+      if (mapPlaceTimer) {
+        clearTimeout(mapPlaceTimer);
+        mapPlaceTimer = null;
+      }
+      return;
+    }
     if (mapPlaceTimer) clearTimeout(mapPlaceTimer);
     mapPlaceTimer = setTimeout(() => {
       mapPlaceTimer = null;
@@ -1078,6 +1127,7 @@ function removeMapPins() {
   for (const { el } of mapPins) el.remove();
   mapPins = [];
   mapPinsFor = null;
+  lastShapeScale = null;
   // Belt and braces: a pin orphaned by a re-render is still ours to clear up.
   document.querySelectorAll(`[${PIN_ATTR}]`).forEach((pin) => pin.remove());
 }
@@ -1269,7 +1319,8 @@ function focusOnMap(item, href) {
 // there's room and above it where there isn't. Measured off its own.
 const POPUP_GAP = 18;
 const POPUP_CLOSE_MS = 120; // grace period for crossing that gap onto the popup
-const POPUP_HARVEST_MS = 300; // long enough for Vue to render the one we asked for
+const POPUP_HARVEST_MS = 2000; // deadline, not a wait: the popup is taken the moment it appears
+const POPUP_HARVEST_RETRY_MS = 600; // before asking again, when a harvest came back with nothing
 const POPUP_HARVEST_TRIES = 3;
 
 let popupSkin = null; // { scope, cardScope, iconClass, iconSize, sprite } off one of the site's
@@ -1296,6 +1347,9 @@ function learnPointHeader(marker, popup) {
 
 function harvestPopupSkin() {
   if (popupSkin || popupHarvests >= POPUP_HARVEST_TRIES) return;
+  // Only while we hold the map. A retry that lands after the toggle went off
+  // would hover one of the site's own markers with nothing hiding the popup.
+  if (!document.documentElement.hasAttribute(MAP_TAKEOVER_ATTR)) return;
   const markers = Array.from(
     document.querySelectorAll(`${MARKER_PANE} .leaflet-marker-icon:not([${PIN_ATTR}]):not([${HOVER_ATTR}])`)
   );
@@ -1303,21 +1357,35 @@ function harvestPopupSkin() {
   // writes over a group, which is wording we would otherwise have to invent,
   // and the cards inside are the same component either way.
   const marker = markers.find((node) => node.querySelector('.marker.multiple')) || markers[0];
-  if (!marker) return;
+  const pane = document.querySelector(POPUP_PANE);
+  if (!marker || !pane) return;
   popupHarvests += 1;
 
-  const before = new Set(document.querySelectorAll(`${POPUP_PANE} .leaflet-popup`));
+  const before = new Set(pane.querySelectorAll('.leaflet-popup'));
   for (const type of ['pointerover', 'mouseover', 'mouseenter']) {
     marker.dispatchEvent(new MouseEvent(type, { bubbles: true }));
   }
 
-  setTimeout(() => {
+  // Take the popup the moment it appears rather than after a fixed interval.
+  // The first hover of a page is the slow one — the site fetches the popup
+  // component then — so a window sized for the second hover misses the first,
+  // and a harvest that misses leaves every pin hover doing nothing at all. The
+  // only way back was a toggle off and on, because that's what resets the try
+  // counter. Hence a deadline generous enough to cover a component still on
+  // its way, and another go if it turns out not to have been.
+  const fresh = () => Array.from(pane.querySelectorAll('.leaflet-popup')).filter((n) => !before.has(n));
+  const arrived = () => fresh().find((n) => n.querySelector('.mapPopup') && n.querySelector('.card'));
+
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    observer.disconnect();
+    clearTimeout(deadline);
     for (const type of ['pointerout', 'mouseout', 'mouseleave']) {
       marker.dispatchEvent(new MouseEvent(type, { bubbles: true }));
     }
-    const popup = Array.from(document.querySelectorAll(`${POPUP_PANE} .leaflet-popup`)).find(
-      (node) => !before.has(node)
-    );
+    const popup = arrived();
     const box = popup?.querySelector('.mapPopup');
     const card = popup?.querySelector('.card');
     const scope = scopeAttrs(box)[0] || null;
@@ -1343,11 +1411,22 @@ function harvestPopupSkin() {
       };
       learnPointHeader(marker, popup);
     }
-    // Ours to clear up: nobody asked for this popup but us, and leaving it
-    // behind would put an agency's listing back over the map the moment the
-    // toggle goes off and the rule that hides it stops applying.
-    popup?.remove();
-  }, POPUP_HARVEST_MS);
+    // Ours to clear up: nobody asked for these but us, and leaving one behind
+    // would put an agency's listing back over the map the moment the toggle
+    // goes off and the rule that hides it stops applying. Everything new in the
+    // pane goes, including a popup that arrived half-built and never finished.
+    for (const node of fresh()) node.remove();
+    // Came back with nothing usable, so ask again while the takeover is still
+    // up, rather than leaving it to the next one — which is a person toggling
+    // the filter off and on by hand.
+    if (!popupSkin) setTimeout(harvestPopupSkin, POPUP_HARVEST_RETRY_MS);
+  };
+
+  const observer = new MutationObserver(() => {
+    if (arrived()) finish();
+  });
+  observer.observe(pane, { childList: true, subtree: true });
+  const deadline = setTimeout(finish, POPUP_HARVEST_MS);
 }
 
 function buildPopupCard(item, horizontal) {

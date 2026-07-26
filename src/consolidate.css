@@ -39,8 +39,18 @@ article[data-sg-v02] .img__wrap {
    as a rule rather than per node means a marker Leaflet adds afterwards is
    hidden the moment it lands, instead of flashing until our next pass. The
    attribute goes on <html>, which is the one element in the page that neither
-   Vue nor Leaflet has any reason to rewrite. */
-html[data-sg-v02-map] .leaflet-marker-pane .leaflet-marker-icon:not([data-sg-v02-pin]):not([data-sg-v02-hover]) {
+   Vue nor Leaflet has any reason to rewrite.
+
+   `:has(.marker)` is what makes this the site's listings rather than everything
+   Leaflet puts in the pane. Not every marker icon is a listing: the ΣΧΕΔΙΑΣΗ
+   tool works by dropping an invisible marker that follows the cursor and takes
+   the clicks that place each corner of the shape, and hiding that is hiding the
+   tool — display:none takes no pointer events, so the pen came on and the map
+   simply ignored you. A listing marker is the one with the site's own .marker
+   inside it; the cursor's has nothing inside it at all. */
+html[data-sg-v02-map]
+  .leaflet-marker-pane
+  .leaflet-marker-icon:not([data-sg-v02-pin]):not([data-sg-v02-hover]):has(.marker) {
   display: none !important;
 }
 

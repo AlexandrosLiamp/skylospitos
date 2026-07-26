@@ -1054,7 +1054,11 @@ function watchMapPane() {
     if (mapPlaceTimer) clearTimeout(mapPlaceTimer);
     mapPlaceTimer = setTimeout(() => {
       mapPlaceTimer = null;
-      placeMapPins();
+      // Holding no pins means the last render declined for want of a
+      // projection, so there's nothing to re-place — rebuild instead. Until
+      // that succeeds the map is showing neither the site's pins nor ours.
+      if (mapPins.length) placeMapPins();
+      else ensureMapPins();
     }, MAP_SETTLE_MS);
   });
   mapPaneObserver.observe(mapPane, { attributes: true, attributeFilter: ['style'] });
@@ -1103,6 +1107,13 @@ function renderMapPins() {
   }
 
   removeMapPins();
+  // Watch this pane before the first placement rather than after it succeeds.
+  // The placement below can decline — a map still loading its tiles has no
+  // projection to read yet — and it drops the pins when it does. The tiles
+  // arriving on this pane are exactly the signal that it's worth another go,
+  // and an observer still attached to the pane a rebuild replaced is an
+  // observer that never fires again.
+  watchMapPane();
   const batch = document.createDocumentFragment();
   mapPins = Array.from(cells.values(), ({ items, lat, lng }) => {
     // Always answers: there are four kinds, prototypeFor tries all four, and
@@ -1124,7 +1135,6 @@ function renderMapPins() {
   mapPinsFor = currentResult;
   document.documentElement.setAttribute(MAP_TAKEOVER_ATTR, '');
   syncMapCaption();
-  watchMapPane();
   harvestPopupSkin();
   return true;
 }

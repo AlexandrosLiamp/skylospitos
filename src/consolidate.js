@@ -1,4 +1,4 @@
-// Spitogatos v0.4 — consolidated view.
+// Spitogatos v0.6 — consolidated view.
 //
 // Runs alongside src/content.js in the same content-script isolated world.
 // See PLAN_V02.md at the repo root for the original feature plan.
@@ -104,7 +104,90 @@ const BACKOFF_MAX_TRIES = 4;
 
 const RESULTS_PER_PAGE = 30; // matches the site's own pagination.perPage
 
+// Searches we've already fetched. Insertion order is the LRU order — least
+// recently used first — which is what the eviction below relies on.
 const cache = new Map(); // canonicalUrl -> { fetchedAt, canonical, listings, totalListings, privateCount, requests }
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 20;
+const CACHE_STORE_KEY = 'sgV02Cache';
+
+// Persisted in sessionStorage, the same per-tab lifetime the toggle uses, so a
+// full document navigation — which the site does, and which «αυτόματη ανανέωση
+// χάρτη» can trigger — doesn't throw away work the user waited through. It's
+// affordable because an entry holds the private listings only: the 9,847-listing
+// Πάτρα search caches 58 objects, not 9,847.
+function loadCache() {
+  let raw = null;
+  try {
+    raw = sessionStorage.getItem(CACHE_STORE_KEY);
+  } catch (err) {
+    console.warn('[SG-V02] could not read the cached searches:', err.message);
+    return;
+  }
+  if (!raw) return;
+  try {
+    const stored = JSON.parse(raw);
+    if (!Array.isArray(stored)) return;
+    const now = Date.now();
+    for (const entry of stored) {
+      // Anything malformed or already expired is dropped rather than trusted —
+      // this store is the page's own origin and the page can write to it too.
+      if (!entry || typeof entry.canonical !== 'string' || !Array.isArray(entry.listings)) continue;
+      if (!(now - entry.fetchedAt <= CACHE_TTL_MS)) continue;
+      cache.set(entry.canonical, entry);
+    }
+    if (cache.size) console.log(`[SG-V02] ${cache.size} cached search(es) restored`);
+  } catch (err) {
+    console.warn('[SG-V02] could not parse the cached searches:', err.message);
+  }
+}
+
+function saveCache() {
+  // Oldest first, so if the quota is short we drop the least useful entries
+  // rather than failing to persist anything at all.
+  let entries = Array.from(cache.values());
+  for (;;) {
+    try {
+      sessionStorage.setItem(CACHE_STORE_KEY, JSON.stringify(entries));
+      return;
+    } catch (err) {
+      if (entries.length > 1) {
+        entries = entries.slice(1);
+        continue;
+      }
+      // Even one search won't fit, or the store is blocked outright. The
+      // in-memory cache still works for this page; only surviving a reload is
+      // lost. Clear the key so a stale half-set doesn't come back later.
+      try {
+        sessionStorage.removeItem(CACHE_STORE_KEY);
+      } catch {
+        /* blocked store: nothing to clean up */
+      }
+      console.warn('[SG-V02] could not persist the cached searches:', err.message);
+      return;
+    }
+  }
+}
+
+function cacheGet(canonical) {
+  const entry = cache.get(canonical);
+  if (!entry) return null;
+  if (Date.now() - entry.fetchedAt > CACHE_TTL_MS) {
+    cache.delete(canonical);
+    return null;
+  }
+  // Re-insert to move it to the young end of the LRU order.
+  cache.delete(canonical);
+  cache.set(canonical, entry);
+  return entry;
+}
+
+function cacheSet(canonical, entry) {
+  cache.delete(canonical);
+  cache.set(canonical, entry);
+  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
+  saveCache();
+}
 
 function canonicalizeUrl(href) {
   // Group all /selida_N variants of the same search under one cache key,
@@ -325,9 +408,10 @@ async function planFetch(signal, backoffState) {
 
 async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
   const canonical = canonicalizeUrl(location.href);
-  if (cache.has(canonical)) {
+  const hit = cacheGet(canonical);
+  if (hit) {
     console.log('[SG-V02] cache hit for', canonical);
-    return cache.get(canonical);
+    return hit;
   }
 
   const backoffState = { tries: 0, delayMs: BACKOFF_BASE_DELAY_MS };
@@ -385,7 +469,7 @@ async function fetchAllPagesForCurrentSearch(signal, onProgress = () => {}) {
     listings: privateOnly,
     requests,
   };
-  cache.set(canonical, result);
+  cacheSet(canonical, result);
 
   console.log(
     `[SG-V02] fetched ${requests} request${requests !== 1 ? 's' : ''} — ${allListings.length} listings total, ${privateOnly.length} private`
@@ -739,7 +823,8 @@ const METRES_PER_DEGREE_LAT = 111320;
 
 let mapPins = []; // [{ el, items, lat, lng, shape }] — one entry per cell, while the takeover is up
 let mapPinsFor = null; // the result object they were built from
-let lastShapeScale = null; // the zoom, as pixels-per-half-world, that the shapes were last built for
+let lastShapeWorld = null; // the zoom, as the world's width in pixels, that the shapes were built for
+let lastPlacedSignature = null; // the projection the pins were last placed against
 let mapPaneObserver = null;
 let observedMapPane = null; // which map pane that observer is attached to
 let mapPlaceTimer = null;
@@ -869,12 +954,20 @@ function mapProjection() {
   if (!best) return null;
 
   const [world, originX, originY] = best.split(' ').map(Number);
-  return (lat, lng) => ({
-    x: world * (0.5 + lng / 360) - originX,
-    y:
-      world * (0.5 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / (2 * Math.PI)) -
-      originY,
-  });
+  // `best` doubles as the signature of this projection. Those three numbers are
+  // the whole of it, so two calls agreeing on them place every pin identically —
+  // which is what lets placeMapPins skip the work entirely. A pan moves the map
+  // pane and leaves all three alone; only a zoom changes them.
+  return {
+    signature: best,
+    world,
+    project: (lat, lng) => ({
+      x: world * (0.5 + lng / 360) - originX,
+      y:
+        world * (0.5 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / (2 * Math.PI)) -
+        originY,
+    }),
+  };
 }
 
 function isBoosted(className) {
@@ -1065,29 +1158,49 @@ function buildPin(items, prototype) {
 
 function placeMapPins() {
   if (!mapPins.length) return false;
-  const project = mapProjection();
+  const projection = mapProjection();
   // Null through a zoom animation, when every coordinate on the map is
   // momentarily a lie, and before the first tile loads. Both resolve on their
   // own, and the style changes that end them bring us back here.
-  if (!project) return false;
+  if (!projection) return false;
 
-  // Half the world in pixels: the same for every origin, different for every
-  // zoom. A marker's shape is a function of the zoom and nothing else, so this
-  // is what says whether the shapes need looking at — and it costs two
-  // multiplications against a rescan of every marker on the map, which on a
-  // wide search is several hundred of them, on every pan and every tile that
-  // lands.
-  const scale = project(0, 180).x - project(0, 0).x;
-  if (scale !== lastShapeScale && syncPinShapes()) lastShapeScale = scale;
+  // Our pins sit in the marker pane holding layer points, exactly like the
+  // site's own, so a pan moves them for free — Leaflet translates the map pane
+  // above them and every child comes along. What a pan does *not* do is change
+  // the projection, and this is where that pays: the pane's transform is
+  // rewritten on every frame of a drag, each rewrite arrives here, and without
+  // this check each one would rewrite `transform` and `zIndex` on several
+  // hundred pins to the values they already hold. An unchanged signature means
+  // every one of those writes is a no-op, so skip the lot.
+  //
+  // It's an exact test, not an approximation: the signature *is* the three
+  // numbers the placement is computed from. If Leaflet ever does shift the
+  // origin under a pan, it changes and we re-place.
+  if (projection.signature === lastPlacedSignature) {
+    // The popup is the exception. Its above-or-below flip reads viewport
+    // rectangles, and those do move under a pan. It's one element, and it
+    // returns immediately when no popup is open.
+    placePopup(projection.project);
+    return true;
+  }
+  lastPlacedSignature = projection.signature;
+
+  // A marker's shape is a function of the zoom and nothing else, and `world` is
+  // the zoom expressed in pixels — so this only looks at the shapes when the
+  // zoom actually changed, rather than rescanning every marker on the map (on a
+  // wide search, several hundred) for every tile that lands.
+  if (projection.world !== lastShapeWorld && syncPinShapes()) {
+    lastShapeWorld = projection.world;
+  }
 
   for (const { el, lat, lng } of mapPins) {
-    const point = project(lat, lng);
+    const point = projection.project(lat, lng);
     el.style.transform = `translate3d(${point.x}px, ${point.y}px, 0px)`;
     // Leaflet stacks markers by how far south they are, so a pin overlaps the
     // one behind it consistently rather than at random. Same rule for ours.
     el.style.zIndex = String(Math.round(point.y));
   }
-  placePopup();
+  placePopup(projection.project);
   return true;
 }
 
@@ -1156,7 +1269,9 @@ function removeMapPins() {
   for (const { el } of mapPins) el.remove();
   mapPins = [];
   mapPinsFor = null;
-  lastShapeScale = null;
+  lastShapeWorld = null;
+  // So the next build always places, however the map is sitting at the time.
+  lastPlacedSignature = null;
   // Belt and braces: a pin orphaned by a re-render is still ours to clear up.
   document.querySelectorAll(`[${PIN_ATTR}]`).forEach((pin) => pin.remove());
 }
@@ -1302,12 +1417,12 @@ function focusOnMap(item, href) {
     return;
   }
 
-  const project = mapProjection();
+  const projection = mapProjection();
   const prototype = prototypeFor(markerKind([item]), markerPrototypes())?.el;
-  if (!project || !prototype || typeof item.latitude !== 'number') return;
+  if (!projection || !prototype || typeof item.latitude !== 'number') return;
 
   const where = markerPoint(item);
-  const point = project(where.lat, where.lng);
+  const point = projection.project(where.lat, where.lng);
   const pin = buildPin([item], prototype);
   pin.removeAttribute(PIN_ATTR);
   pin.setAttribute(HOVER_ATTR, '');
@@ -1617,15 +1732,17 @@ function buildPopup(entry) {
   return popup;
 }
 
-function placePopup() {
+// `project` is optional: placeMapPins has one in hand and passes it rather than
+// paying for a second scan of the tiles on the same pass.
+function placePopup(project) {
   if (!openPopup) return;
   const { el, entry } = openPopup;
-  const project = mapProjection();
+  const projector = project || mapProjection()?.project;
   // Null mid-zoom, when every coordinate on the map is briefly a lie. The pass
   // that ends the zoom brings us back here.
-  if (!project) return;
+  if (!projector) return;
 
-  const point = project(entry.lat, entry.lng);
+  const point = projector(entry.lat, entry.lng);
   const height = el.offsetHeight;
   const container = document.querySelector('.leaflet-container');
   const room = container
@@ -2062,6 +2179,20 @@ let v02Loading = false;
 let v02Progress = null; // { fetched, total } during a fetch, else null
 let lastFullHref = location.href;
 let activeController = null;
+let activeCanonical = null; // the search activeController is fetching, while it runs
+
+// How long the URL has to hold still after a navigation before we fetch. Long
+// enough to swallow a map drag under «αυτόματη ανανέωση χάρτη», which rewrites
+// the URL repeatedly as the map moves.
+const NAV_SETTLE_MS = 700;
+let navSettleTimer = null;
+
+function cancelPendingNav() {
+  if (navSettleTimer) {
+    clearTimeout(navSettleTimer);
+    navSettleTimer = null;
+  }
+}
 
 function syncToggleProgress() {
   setToggleProgress(
@@ -2069,14 +2200,14 @@ function syncToggleProgress() {
   );
 }
 
-// A page with no results column has nothing to take over. This matters more
-// now that consolidation is on by default and runs on every navigation, not
-// just when a button was pressed on a search page: `performance`'s resource
-// timeline survives the site's client-side navigation, so on a listing page
-// reached from a search, planFetch would find the search we came from and
-// re-fetch all of it before renderTakeover threw the lot away. Polled rather
-// than checked once, because on a client-side navigation Vue may not have
-// rendered the column yet by the time the observer fires.
+// A page with no results column has nothing to take over. This matters because
+// consolidation follows every navigation once the toggle is on, not just the
+// page the button was pressed on: `performance`'s resource timeline survives
+// the site's client-side navigation, so on a listing page reached from a
+// search, planFetch would find the search we came from and re-fetch all of it
+// before renderTakeover threw the lot away. Polled rather than checked once,
+// because on a client-side navigation Vue may not have rendered the column yet
+// by the time the observer fires.
 async function waitForResultsColumn(signal, timeoutMs = 3000, pollMs = 150) {
   const start = performance.now();
   while (performance.now() - start < timeoutMs) {
@@ -2094,6 +2225,7 @@ async function runConsolidation() {
 
   v02Loading = true;
   v02Progress = null;
+  activeCanonical = canonicalizeUrl(location.href);
   syncToggleProgress();
   try {
     if (!(await waitForResultsColumn(controller.signal))) return;
@@ -2118,6 +2250,7 @@ async function runConsolidation() {
     if (controller === activeController) {
       v02Loading = false;
       v02Progress = null;
+      activeCanonical = null;
       syncToggleProgress();
     }
   }
@@ -2178,59 +2311,73 @@ function handlePossibleNav() {
   if (!filterEnabled) return;
   if (nowCanonical === prevCanonical) return;
 
-  // Different search (base path or sort/filter param): drop the stale view,
-  // invalidate the previous canonical's cache entry so retrying that URL later
-  // re-fetches fresh data, cancel any in-flight fetch that was still targeting
-  // the old search, and re-run for the new URL.
-  cache.delete(prevCanonical);
-  if (activeController) activeController.abort();
+  // A different search (base path or sort/filter param). Drop the stale view at
+  // once so nothing false is left on screen, but don't start fetching yet.
+  // «Αυτόματη ανανέωση χάρτη» re-runs the search on every map move, so one drag
+  // arrives here several times over and each arrival used to be a full crawl of
+  // a view the user was already leaving. Wait for the URL to stop changing and
+  // fetch wherever it came to rest.
+  //
+  // The previous search stays cached. It used to be deleted here so that
+  // returning to it re-fetched, which is exactly what made panning back and
+  // forth crawl every single time; the TTL is what keeps entries honest now.
   teardownTakeover();
-  runConsolidation();
+  cancelPendingNav();
+  navSettleTimer = setTimeout(() => {
+    navSettleTimer = null;
+    const canonical = canonicalizeUrl(location.href);
+    // Already fetching this very search — a pan that wandered off and came back
+    // inside one settle. Restarting would abandon the progress the user is
+    // watching and re-request every page of it.
+    if (v02Loading && activeCanonical === canonical) return;
+    if (activeController) activeController.abort();
+    runConsolidation();
+  }, NAV_SETTLE_MS);
 }
 
-// The toggle lives in content.js, so its clicks reach us as storage changes.
-// (chrome.storage.onChanged fires in the writing context too, which is what
-// makes this work for the tab the user actually clicked in.)
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'sync' || !changes.filterEnabled) return;
-  if (changes.filterEnabled.newValue) {
+// The toggle lives in content.js, which calls this on every click. It used to
+// reach us as a chrome.storage.onChanged event; the state is per-tab now and
+// never goes near extension storage, so the call is direct.
+function onFilterToggled(enabled) {
+  if (enabled) {
     runConsolidation();
     return;
   }
   // Off hands the results column straight back to the site, and cancels an
   // in-flight fetch — runConsolidation's own `finally` clears the progress
   // readout once the abort lands.
+  cancelPendingNav();
   if (activeController) activeController.abort();
   teardownTakeover();
-});
+}
 
-// Initial hydration: load persisted state and, if on, run consolidation once
-// the site has settled.
-chrome.storage.sync.get({ filterEnabled: true, consolidateEnabled: null }, async (stored) => {
-  // On a failed read the callback gets nothing at all, so fall back to the same
-  // defaults we asked for. Survivable, but log it: it would otherwise present
-  // as the toggle having silently forgotten which way the user left it.
-  if (chrome.runtime.lastError) {
-    console.warn('[SG-V02] could not read the toggle state:', chrome.runtime.lastError.message);
-  }
-  const state = stored || { filterEnabled: true, consolidateEnabled: null };
-  // v0.3 had a second toggle with a key of its own; one button now, so retire
-  // it rather than leaving a dead value in sync storage forever.
-  if (state.consolidateEnabled !== null) chrome.storage.sync.remove('consolidateEnabled');
+// Initial hydration: read the tab's remembered state and, if on, run
+// consolidation once the site has settled.
+(async () => {
+  loadCache();
+  // Both toggles the extension has ever had are per-tab now. Clear what earlier
+  // versions left in sync storage rather than leaving dead values there forever
+  // — including `filterEnabled`, which would otherwise sit in every synced
+  // profile saying "on" long after nothing reads it.
+  chrome.storage.sync.remove(['filterEnabled', 'consolidateEnabled'], () => {
+    if (chrome.runtime.lastError) {
+      console.warn('[SG-V02] could not clear the old synced state:', chrome.runtime.lastError.message);
+    }
+  });
   await loadLabels();
   await new Promise((r) => setTimeout(r, 1500));
-  // The live toggle, not the value this callback read a second and a half ago.
+  // The live toggle, read now rather than captured a second and a half ago.
   // Turning the filter off inside that window leaves the off-switch nothing to
   // undo — activeController is still null and no takeover is up yet, so both
-  // its abort and its teardown are no-ops — and the captured value would then
+  // its abort and its teardown are no-ops — and a captured value would then
   // start one anyway, against a toggle that reads off. Nothing takes it down
   // afterwards either: reassertTakeover's first guard is !filterEnabled, so it
   // declines to touch a takeover it should be removing, and the column stays
   // ours until the user toggles on and off again by hand.
   //
   // The second half of that window is the mirror image: turning the filter on
-  // has the storage listener start a consolidation of its own, and running
-  // again here would abort it and refetch from the beginning, resetting the
-  // progress the user is watching.
+  // has onFilterToggled start a consolidation of its own, and running again
+  // here would abort it and refetch from the beginning, resetting the progress
+  // the user is watching.
   if (filterEnabled && !v02Loading && !currentResult) await runConsolidation();
-});
+})();

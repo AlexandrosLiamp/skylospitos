@@ -153,17 +153,28 @@ tile's URL says where in the world it belongs, its `transform` says where it
 actually landed, and the difference is the origin every pin is measured from.
 Panning is free — Leaflet moves the whole pane and every layer point stays
 valid — but a zoom rewrites all of them, so the pins re-place themselves
-whenever the map pane or its tiles change.
+whenever the map pane or its tiles change. Those three numbers are also how
+the extension knows when *not* to bother: they're unchanged by a pan, so a
+drag, which fires the same notifications on every frame, does no work at all.
 
 Turning the toggle off puts the site's own pins back.
 
 ### Practical details worth knowing
 
-- It's on by default, which is a change from v0.3, where consolidating was
-  a second button you had to press. One button means one default, and the
-  extension exists to show you the private listings — all of them, not the
-  ones that happen to be on page 1. Turning it off hands the results column
-  straight back to the site, mid-fetch included.
+- **It starts off.** Turning it on fetches every page of the search, which is
+  real traffic and a real wait, and doing that uninvited to every spitogatos
+  page you happen to open is not a reasonable thing for an extension to do.
+  So you press the button when you want it. Your choice is remembered for the
+  rest of that tab — the site's own navigations, paging and map moves won't
+  undo it — and a new tab starts off again. Turning it off hands the results
+  column straight back to the site, mid-fetch included.
+- **Searches you've already loaded are kept**, for ten minutes and up to
+  twenty of them, so going back to one costs nothing. This matters most with
+  «αυτόματη ανανέωση χάρτη» on, where every map move is a new search as far as
+  the site is concerned: the extension waits for the map to stop before
+  fetching, so one drag is one fetch rather than one per frame, and panning
+  back somewhere you've been is free. The cache lives as long as the tab does,
+  so a full page reload doesn't throw the wait away.
 - Two endpoints back this, both taking the same query string as the search
   itself and both returning the `enquirerId` field that marks a private
   seller:

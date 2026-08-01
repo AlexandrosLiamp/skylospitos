@@ -136,7 +136,9 @@ function loadCache() {
       if (!(now - entry.fetchedAt <= CACHE_TTL_MS)) continue;
       cache.set(entry.canonical, entry);
     }
-    if (cache.size) console.log(`[SG-V02] ${cache.size} cached search(es) restored`);
+    if (cache.size) {
+      console.log(`[SG-V02] restored ${cache.size} cached search${cache.size !== 1 ? 'es' : ''}`);
+    }
   } catch (err) {
     console.warn('[SG-V02] could not parse the cached searches:', err.message);
   }
@@ -2236,6 +2238,17 @@ async function runConsolidation() {
     });
     if (controller.signal.aborted) return;
     if (!result) return;
+    // The URL can move while a fetch is in flight, and under «αυτόματη ανανέωση
+    // χάρτη» it does so constantly. Only paint a result that describes the
+    // search actually on screen — otherwise the previous area's listings land
+    // in this one's column and reassertTakeover keeps them there for the whole
+    // of the next fetch. Checked against the live URL rather than against an
+    // abort, because a change hasn't necessarily reached handlePossibleNav yet:
+    // that runs off a DOM observer debounced at 250ms.
+    if (result.canonical !== canonicalizeUrl(location.href)) {
+      console.log(`[SG-V02] dropping a result for ${result.canonical} — the page has moved on`);
+      return;
+    }
     currentResult = result;
     currentPage = 1;
     renderTakeover();
@@ -2321,6 +2334,12 @@ function handlePossibleNav() {
   // The previous search stays cached. It used to be deleted here so that
   // returning to it re-fetched, which is exactly what made panning back and
   // forth crawl every single time; the TTL is what keeps entries honest now.
+  // The fetch that may still be running for the search we're leaving is left
+  // alone rather than aborted here, so that a drag which wanders off and comes
+  // straight back finds its own crawl still going. What keeps it honest is the
+  // guard in runConsolidation: a result is only painted if it still describes
+  // the URL on screen. The worst it can now cost is the tail of one fetch the
+  // settle below is about to replace anyway.
   teardownTakeover();
   cancelPendingNav();
   navSettleTimer = setTimeout(() => {

@@ -2227,7 +2227,10 @@ async function runConsolidation() {
 
   v02Loading = true;
   v02Progress = null;
-  activeCanonical = canonicalizeUrl(location.href);
+  // Held locally as well, because the module-level copy belongs to whichever
+  // run is current and this one may not be by the time it finishes.
+  const startedFor = canonicalizeUrl(location.href);
+  activeCanonical = startedFor;
   syncToggleProgress();
   try {
     if (!(await waitForResultsColumn(controller.signal))) return;
@@ -2255,10 +2258,15 @@ async function runConsolidation() {
   } catch (err) {
     if (err?.name === 'AbortError') return;
     console.error('[SG-V02] fetch pipeline failed:', err);
+    // Same reasoning as the render guard above: a fetch left running while the
+    // user moved on can fail on its own account, and an error notice about a
+    // search that is no longer on screen is worse than none — it sits over the
+    // site's results describing a failure the user can't place.
+    if (startedFor !== canonicalizeUrl(location.href)) return;
     // Report the failure in the site's own 30-per-page terms even when we
     // fetch 300 at a time — "σελίδα 11" is something the user can locate.
     const pageNumber = err?.offset != null ? Math.floor(err.offset / 30) + 1 : null;
-    renderConsolidationError(pageNumber, err?.message || String(err), canonicalizeUrl(location.href));
+    renderConsolidationError(pageNumber, err?.message || String(err), startedFor);
   } finally {
     if (controller === activeController) {
       v02Loading = false;

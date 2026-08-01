@@ -1178,7 +1178,14 @@ function placeMapPins() {
   // It's an exact test, not an approximation: the signature *is* the three
   // numbers the placement is computed from. If Leaflet ever does shift the
   // origin under a pan, it changes and we re-place.
-  if (projection.signature === lastPlacedSignature) {
+  // Both halves have to be settled to skip, not just the placement. A zoom that
+  // arrives before the site has redrawn its own markers leaves syncPinShapes
+  // with nothing to read a shape off, and it says so by returning false so the
+  // caller keeps looking. Skipping on the signature alone would stop the
+  // looking: the pins would hold the previous zoom's shape until the next zoom
+  // or a rebuild, which is the disappearing-pins bug the shape sync exists to
+  // prevent.
+  if (projection.signature === lastPlacedSignature && projection.world === lastShapeWorld) {
     // The popup is the exception. Its above-or-below flip reads viewport
     // rectangles, and those do move under a pan. It's one element, and it
     // returns immediately when no popup is open.
@@ -2229,11 +2236,18 @@ async function runConsolidation() {
   v02Progress = null;
   // Held locally as well, because the module-level copy belongs to whichever
   // run is current and this one may not be by the time it finishes.
-  const startedFor = canonicalizeUrl(location.href);
+  let startedFor = canonicalizeUrl(location.href);
   activeCanonical = startedFor;
   syncToggleProgress();
   try {
     if (!(await waitForResultsColumn(controller.signal))) return;
+    // The column can take a moment to appear on a client-side navigation, and
+    // the URL can move again while we wait. What we're about to fetch is the
+    // search that's here now — which is what fetchAllPagesForCurrentSearch will
+    // read for itself, so this keeps our record of it honest for both the
+    // settle timer's in-flight check and the error path below.
+    startedFor = canonicalizeUrl(location.href);
+    activeCanonical = startedFor;
     const result = await fetchAllPagesForCurrentSearch(controller.signal, (fetched, total) => {
       if (controller !== activeController) return;
       v02Progress = { fetched, total };
@@ -2386,10 +2400,24 @@ function onFilterToggled(enabled) {
   // versions left in sync storage rather than leaving dead values there forever
   // — including `filterEnabled`, which would otherwise sit in every synced
   // profile saying "on" long after nothing reads it.
-  chrome.storage.sync.remove(['filterEnabled', 'consolidateEnabled'], () => {
+  // Read before removing, so this costs a sync *write* only on the first page
+  // load after upgrading rather than on every page load forever. Sync writes
+  // are quota'd and replicate to the user's other devices; there's no reason to
+  // spend one saying nothing.
+  chrome.storage.sync.get(['filterEnabled', 'consolidateEnabled'], (left) => {
     if (chrome.runtime.lastError) {
-      console.warn('[SG-V02] could not clear the old synced state:', chrome.runtime.lastError.message);
+      console.warn('[SG-V02] could not read the old synced state:', chrome.runtime.lastError.message);
+      return;
     }
+    const keys = Object.keys(left || {});
+    if (!keys.length) return;
+    chrome.storage.sync.remove(keys, () => {
+      if (chrome.runtime.lastError) {
+        console.warn('[SG-V02] could not clear the old synced state:', chrome.runtime.lastError.message);
+        return;
+      }
+      console.log(`[SG-V02] cleared ${keys.join(', ')} from sync storage — the toggle is per-tab now`);
+    });
   });
   await loadLabels();
   await new Promise((r) => setTimeout(r, 1500));

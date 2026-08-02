@@ -1,0 +1,13 @@
+# Normalize all text to LF in the repository and in the working tree.
+# This repo has been edited from Windows before; without this, every file shows
+# up as fully modified whenever line endings get rewritten.
+* text=auto eol=lf
+
+# Binary assets — never touch their bytes.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary

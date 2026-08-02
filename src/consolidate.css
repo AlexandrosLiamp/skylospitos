@@ -1,174 +1,118 @@
-/* v0.2 secondary toggle button — sits right after the v1 "Μόνο Ιδιώτες"
-   button in the site's filter toolbar. Same shape/size as v1's; slightly
-   subdued colour when off (secondary action), same orange when on. */
+/* ---- Consolidated view: taking over the results column ----
 
-.sg-v02-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 0 0 6px;
-  padding: 0 15px;
-  height: 40px;
-  border: 1px solid rgba(185, 189, 209, 0.5);
-  border-radius: 5px;
-  box-sizing: border-box;
-  font-family: Manrope, Arial, sans-serif;
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1;
-  cursor: pointer;
-  user-select: none;
-  background-color: #ffffff;
-  color: #555555;
-  transition: background-color 0.15s ease, color 0.15s ease,
-              border-color 0.15s ease, transform 0.05s ease, opacity 0.15s ease;
-  -webkit-font-smoothing: antialiased;
+   Almost nothing here styles our cards. They carry the site's own class names
+   and Vue scope attributes (see harvestSkin in consolidate.js), so the site's
+   stylesheet draws them and they stay correct through its redesigns. What's
+   left is hiding the originals and getting our wrapper out of the way. */
+
+/* The site's own cards, its paginator, and the agency promo banners step
+   aside while the consolidated view holds the column. Everything of ours is
+   marked [data-sg-v02], which is what keeps our paginator out of this. */
+.sg-v02-takeover article.ordered-element:not([data-sg-v02]),
+.sg-v02-takeover .expert-banner,
+.sg-v02-takeover nav.pagination:not([data-sg-v02]) {
+  display: none !important;
 }
 
-.sg-v02-toggle:hover:not(:disabled) {
-  filter: brightness(0.97);
+/* The site wraps its paginator in an otherwise empty div that keeps its own
+   margins; hide that too or the column ends on a band of dead space. */
+.sg-v02-takeover div:has(> nav.pagination:not([data-sg-v02])) {
+  display: none !important;
 }
 
-.sg-v02-toggle:active:not(:disabled) {
-  transform: translateY(1px);
+/* Gallery view drops our paginator into the card row, which is a wrapping
+   flex container — claim a full line there. Harmless in list view, where the
+   nav is a block-level child of the column anyway. */
+.sg-v02-takeover nav.pagination[data-sg-v02] {
+  width: 100%;
 }
 
-.sg-v02-toggle:focus-visible {
-  outline: 2px solid #FE900A;
-  outline-offset: 2px;
+/* A handful of listings come back with no image at all. The site's own card
+   never renders an empty frame, so give ours something to be. */
+article[data-sg-v02] .img__wrap {
+  background: #eef0f4;
 }
 
-.sg-v02-toggle[data-loading] {
-  cursor: progress;
-  opacity: 0.7;
+/* ---- Consolidated view: taking over the map's pins ----
+
+   While the view is up the map shows its listings and nothing else. Doing this
+   as a rule rather than per node means a marker Leaflet adds afterwards is
+   hidden the moment it lands, instead of flashing until our next pass. The
+   attribute goes on <html>, which is the one element in the page that neither
+   Vue nor Leaflet has any reason to rewrite.
+
+   `:has(.marker)` is what makes this the site's listings rather than everything
+   Leaflet puts in the pane. Not every marker icon is a listing: the ΣΧΕΔΙΑΣΗ
+   tool works by dropping an invisible marker that follows the cursor and takes
+   the clicks that place each corner of the shape, and hiding that is hiding the
+   tool — display:none takes no pointer events, so the pen came on and the map
+   simply ignored you. A listing marker is the one with the site's own .marker
+   inside it; the cursor's has nothing inside it at all. */
+html[data-sg-v02-map]
+  .leaflet-marker-pane
+  .leaflet-marker-icon:not([data-sg-v02-pin]):not([data-sg-v02-hover]):has(.marker) {
+  display: none !important;
 }
 
-.sg-v02-toggle[data-on="true"] {
-  background-color: #FE900A;
-  color: #ffffff;
+/* Same for the popups. Every popup the site opens belongs to a marker we've
+   hidden, so it would float an agency's listing over a map that has none —
+   including the one we ask it for ourselves to read the popup's markup off
+   (harvestPopupSkin). Ours is the only one that should ever be up. */
+html[data-sg-v02-map] .leaflet-popup-pane .leaflet-popup:not([data-sg-v02-popup]) {
+  display: none !important;
+}
+
+/* Leaflet's popup pane doesn't take pointer events in every version, and a
+   popup you can't move onto is a listing you can't click through to. */
+.leaflet-popup-pane [data-sg-v02-popup] {
+  pointer-events: auto;
+}
+
+/* Zoomed in past the dots, the site draws each marker as a near-white pill
+   (#f9fafd) with a 2px white border — which reads well over its own muted map
+   and disappears over anything busier. Ours take the site's accent orange on
+   that border instead: same pill, same size, same price inside it, but findable
+   at a glance. Only the expanded ones; further out a marker is an orange dot
+   already and a border of the same colour would just erase its outline. */
+.leaflet-marker-pane [data-sg-v02-pin] .marker.expanded {
   border-color: #FE900A;
 }
 
-.sg-v02-toggle__dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: currentColor;
-  opacity: 0.95;
+/* The site raises a hovered pin above its neighbours by reordering its own
+   Leaflet layers, which ours aren't part of. Cheaper to say it here than to
+   bookkeep two z-indexes per pin in JS — and !important is what beats the
+   inline z-index that placeMapPins writes. */
+.leaflet-marker-pane [data-sg-v02-pin]:has(.marker.focused) {
+  z-index: 10000 !important;
 }
 
-.sg-v02-toggle[data-on="false"] .sg-v02-toggle__dot {
-  opacity: 0.5;
-}
-
-/* Spitogatos v0.2 — consolidated view styles.
-   Deliberately visually distinct from the site's own cards (softer border,
-   neutral tone) so users can tell this is extension-added content, not
-   part of the site's native results grid. */
-
-.sg-v02-consolidated {
+/* Empty state and fetch failures. Deliberately plain: the site has no
+   equivalent element to borrow a look from. */
+.sg-v02-notice {
   margin: 24px 0 40px;
-  padding: 16px 0;
-  border-top: 1px dashed rgba(185, 189, 209, 0.7);
+  padding: 20px;
+  border: 1px solid rgba(185, 189, 209, 0.5);
+  border-radius: 10px;
+  background: #fbfbfc;
   font-family: Manrope, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
-.sg-v02-consolidated__header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 16px;
-  padding: 0 8px;
-  font-size: 15px;
-  font-weight: 700;
-  color: #333;
-}
-
-.sg-v02-consolidated__header::before {
-  content: '';
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #FE900A;
-}
-
-.sg-v02-consolidated__note {
-  padding: 12px 8px;
-  font-size: 13px;
-  color: #777;
-}
-
-.sg-v02-consolidated__grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 16px;
-  padding: 0 8px;
-}
-
-.sg-v02-card {
-  display: flex;
-  flex-direction: column;
-  border: 1px solid rgba(185, 189, 209, 0.5);
-  border-radius: 6px;
-  overflow: hidden;
-  background: #fff;
-  text-decoration: none;
-  color: inherit;
-  transition: box-shadow 0.15s ease, transform 0.05s ease;
-}
-
-.sg-v02-card:hover {
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-}
-
-.sg-v02-card:active {
-  transform: translateY(1px);
-}
-
-.sg-v02-card__img {
-  width: 100%;
-  aspect-ratio: 3 / 2;
-  object-fit: cover;
-  background: #f2f2f2;
-  display: block;
-}
-
-.sg-v02-card__body {
-  padding: 10px 12px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.sg-v02-card__price {
-  font-size: 16px;
-  font-weight: 800;
-  color: #FE900A;
-}
-
-.sg-v02-card__meta {
-  font-size: 13px;
+.sg-v02-notice__text {
+  margin: 0;
+  font-size: 14px;
   color: #555;
 }
 
-.sg-v02-card__geo {
-  font-size: 12px;
-  color: #888;
+.sg-v02-notice--error {
+  border-color: rgba(211, 51, 51, 0.4);
+  background: #fdf7f7;
 }
 
-/* Error state: same shell, red accent on the header dot, retry button
-   right below the note. */
-
-.sg-v02-consolidated--error .sg-v02-consolidated__header::before {
-  background: #d33;
-}
-
-.sg-v02-consolidated__retry {
+.sg-v02-notice__retry {
   display: inline-flex;
   align-items: center;
-  margin: 4px 8px 0;
+  margin: 12px 0 0;
   padding: 8px 14px;
   border: 1px solid rgba(185, 189, 209, 0.7);
   border-radius: 5px;
@@ -180,11 +124,11 @@
   cursor: pointer;
 }
 
-.sg-v02-consolidated__retry:hover {
+.sg-v02-notice__retry:hover {
   background: #f5f5f5;
 }
 
-.sg-v02-consolidated__retry:focus-visible {
+.sg-v02-notice__retry:focus-visible {
   outline: 2px solid #FE900A;
   outline-offset: 2px;
 }
